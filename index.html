@@ -1,0 +1,3450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CyberQuest RPG</title>
+<link href="https://fonts.googleapis.com/css2?family=Cinzel+Decorative:wght@700;900&family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<!-- Firebase SDK (ESM via CDN) -->
+<script type="module">
+import { initializeApp }                          from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js';
+import { getAuth, signInAnonymously, onAuthStateChanged } from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
+import { getFirestore, doc, getDoc, setDoc, updateDoc,
+         collection, addDoc, query, orderBy, limit,
+         getDocs, serverTimestamp, increment }     from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
+
+/* ══════════════════════════════════════════════════════
+   FIREBASE CONFIG
+   → Go to console.firebase.google.com
+   → Create project  "cyberquest-rpg"
+   → Add a Web App  → copy the firebaseConfig object
+   → Paste the 6 values below replacing PASTE_YOUR_...
+   → Enable Firestore (test mode, asia-south1)
+   → Enable Anonymous Authentication only
+══════════════════════════════════════════════════════ */
+const firebaseConfig = {
+  apiKey:            "AIzaSyDrH2shLWAGX2v_aDT2u9c0890PesC4qmU",
+  authDomain:        "cyberquest-rpg.firebaseapp.com",
+  projectId:         "cyberquest-rpg",
+  storageBucket:     "cyberquest-rpg.firebasestorage.app",
+  messagingSenderId: "1074683920051",
+  appId:             "1:1074683920051:web:a463dcd25eb3cb6701bac6"
+};
+
+/* ── Init ── */
+const fbApp  = initializeApp(firebaseConfig);
+const fbAuth = getAuth(fbApp);
+const fbDb   = getFirestore(fbApp);
+
+/* ── State ── */
+let fbUid        = null;   // anonymous UID (private, never shown)
+let fbGuardianId = null;   // "Guardian #XXXX" (public persona)
+let fbReady      = false;
+
+/* ══════════════════════════════════════════════════════
+   SESSION SYSTEM
+   sessions/{uid}  — private, only this browser can r/w
+══════════════════════════════════════════════════════ */
+async function fbEnsureSession(uid) {
+  const ref  = doc(fbDb, 'sessions', uid);
+  const snap = await getDoc(ref);
+  if (snap.exists()) {
+    fbGuardianId = snap.data().guardianId;
+  } else {
+    fbGuardianId = 'Guardian #' + String(Math.floor(1000 + Math.random() * 9000));
+    await setDoc(ref, {
+      guardianId:    fbGuardianId,
+      createdAt:     serverTimestamp(),
+      gamesPlayed:   0,
+      totalXP:       0,
+      bestScore:     0,
+      bestAccuracy:  0
+    });
+  }
+  // Update name in HUD
+  const el = document.querySelector('.hud-name');
+  if (el) el.textContent = fbGuardianId;
+  window.fbGuardianId = fbGuardianId;
+  fbReady = true;
+}
+
+onAuthStateChanged(fbAuth, async user => {
+  if (user) {
+    fbUid = user.uid;
+    await fbEnsureSession(fbUid);
+  } else {
+    try {
+      await signInAnonymously(fbAuth);
+    } catch(e) {
+      console.warn('Firebase anon sign-in failed:', e.message);
+    }
+  }
+});
+
+/* ══════════════════════════════════════════════════════
+   SAVE RUN
+   Called at end of both labyrinth and 3D world
+   xp       — XP earned this run
+   accuracy — % correct answers / successful fights (0–100)
+   hp       — HP remaining at end
+   coins    — coins at end
+   zone     — 'labyrinth' | 'world3d'
+══════════════════════════════════════════════════════ */
+window.fbSaveRun = async function(xp, accuracy, hp, coins, zone = 'world3d') {
+  if (!fbReady || !fbUid) return;
+  const score = xp + (accuracy * 2) + (hp);   // composite score formula
+
+  try {
+    /* 1. Update private session */
+    const sessionRef = doc(fbDb, 'sessions', fbUid);
+    await updateDoc(sessionRef, {
+      gamesPlayed:  increment(1),
+      totalXP:      increment(xp),
+      lastPlayedAt: serverTimestamp()
+    });
+
+    /* 2. Update leaderboard — only if new score beats previous best */
+    const lbRef  = doc(fbDb, 'leaderboard', fbUid);
+    const lbSnap = await getDoc(lbRef);
+    const prev   = lbSnap.exists() ? (lbSnap.data().score || 0) : 0;
+    if (score > prev) {
+      await setDoc(lbRef, {
+        guardianId: fbGuardianId,
+        score,
+        xp,
+        accuracy,
+        hp,
+        coins,
+        zone,
+        updatedAt: serverTimestamp()
+      });
+      await updateDoc(sessionRef, { bestScore: score, bestAccuracy: accuracy });
+    }
+
+    /* 3. Append to runs collection for analytics (no UID stored) */
+    await addDoc(collection(fbDb, 'runs'), {
+      guardianId: fbGuardianId,   // pseudonym only — no UID
+      zone,
+      xp,
+      accuracy,
+      hp,
+      coins,
+      score,
+      playedAt: serverTimestamp()
+    });
+
+  } catch(e) {
+    console.warn('fbSaveRun error:', e.message);
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   LOAD LEADERBOARD (top 10 by score)
+══════════════════════════════════════════════════════ */
+window.fbLoadLeaderboard = async function() {
+  const el = document.getElementById('lb-rows');
+  if (!el) return;
+  el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:1.5rem;font-size:.8rem;font-family:\'Share Tech Mono\',monospace">Loading…</div>';
+
+  try {
+    const q    = query(collection(fbDb, 'leaderboard'), orderBy('score', 'desc'), limit(10));
+    const snap = await getDocs(q);
+
+    if (snap.empty) {
+      el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:2rem;font-size:.8rem;font-family:\'Share Tech Mono\',monospace">No runs recorded yet.<br>Be the first Guardian.</div>';
+      return;
+    }
+
+    el.innerHTML = '';
+    let rank = 1;
+    snap.forEach(d => {
+      const r  = d.data();
+      const me = (r.guardianId === fbGuardianId);
+      const row = document.createElement('div');
+      row.style.cssText = `display:flex;align-items:center;gap:.6rem;padding:.55rem .7rem;
+        border-bottom:1px solid rgba(255,255,255,.05);font-size:.78rem;
+        ${me ? 'background:rgba(201,168,76,.08);border:1px solid rgba(201,168,76,.3);margin:2px 0;' : ''}`;
+
+      const medal = rank === 1 ? '🥇' : rank === 2 ? '🥈' : rank === 3 ? '🥉' : `<span style="color:var(--muted);font-family:'Share Tech Mono',monospace;font-size:.7rem">#${rank}</span>`;
+      row.innerHTML = `
+        <div style="width:28px;text-align:center">${medal}</div>
+        <div style="flex:1;font-family:'Share Tech Mono',monospace;color:${me?'var(--gold2)':'var(--text)'}">
+          ${r.guardianId}${me?' <span style="color:var(--cyan);font-size:.65rem">◀ YOU</span>':''}
+        </div>
+        <div style="display:flex;gap:.4rem;flex-wrap:wrap;justify-content:flex-end">
+          <span style="background:rgba(255,215,0,.1);border:1px solid rgba(255,215,0,.2);color:#ffd700;padding:.1rem .35rem;font-family:'Share Tech Mono',monospace;font-size:.65rem">${r.xp} XP</span>
+          <span style="background:rgba(0,255,136,.08);border:1px solid rgba(0,255,136,.2);color:var(--green);padding:.1rem .35rem;font-family:'Share Tech Mono',monospace;font-size:.65rem">${r.accuracy}% ACC</span>
+          <span style="background:rgba(201,168,76,.08);border:1px solid rgba(201,168,76,.2);color:var(--gold);padding:.1rem .35rem;font-family:'Share Tech Mono',monospace;font-size:.65rem">${r.score} PTS</span>
+        </div>`;
+      el.appendChild(row);
+      rank++;
+    });
+  } catch(e) {
+    el.innerHTML = `<div style="color:var(--red);text-align:center;padding:1.5rem;font-size:.78rem;font-family:'Share Tech Mono',monospace">⚠ Could not load leaderboard.<br><span style="color:var(--muted)">${e.message}</span></div>`;
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   LOAD ANALYTICS (last 100 runs)
+══════════════════════════════════════════════════════ */
+window.fbLoadAnalytics = async function() {
+  const el = document.getElementById('lb-analytics');
+  if (!el) return;
+  el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:1.5rem;font-size:.8rem;font-family:\'Share Tech Mono\',monospace">Crunching data…</div>';
+
+  try {
+    const q    = query(collection(fbDb, 'runs'), orderBy('playedAt', 'desc'), limit(100));
+    const snap = await getDocs(q);
+
+    if (snap.empty) {
+      el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:2rem;font-size:.8rem;font-family:\'Share Tech Mono\',monospace">No run data yet.</div>';
+      return;
+    }
+
+    let total = 0, sumXP = 0, sumAcc = 0, sumHP = 0, labCount = 0, w3Count = 0;
+    const threatDeaths = {};
+
+    snap.forEach(d => {
+      const r = d.data();
+      total++;
+      sumXP  += r.xp       || 0;
+      sumAcc += r.accuracy || 0;
+      sumHP  += r.hp       || 0;
+      if (r.zone === 'labyrinth') labCount++;
+      else w3Count++;
+      if (r.hp <= 0 && r.fallenAt) {
+        threatDeaths[r.fallenAt] = (threatDeaths[r.fallenAt] || 0) + 1;
+      }
+    });
+
+    const avgXP  = Math.round(sumXP  / total);
+    const avgAcc = Math.round(sumAcc / total);
+    const avgHP  = Math.round(sumHP  / total);
+
+    const statRow = (label, value, color='var(--text)') =>
+      `<div style="display:flex;justify-content:space-between;align-items:center;
+        padding:.42rem 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.82rem">
+        <span style="color:var(--muted)">${label}</span>
+        <span style="color:${color};font-family:'Share Tech Mono',monospace">${value}</span>
+      </div>`;
+
+    el.innerHTML = `
+      <div style="margin-bottom:.6rem;font-family:'Share Tech Mono',monospace;font-size:.65rem;color:var(--muted);letter-spacing:2px">AGGREGATE — LAST ${total} RUNS</div>
+      ${statRow('Total runs recorded', total, 'var(--cyan)')}
+      ${statRow('Avg XP per run', avgXP + ' XP', '#ffd700')}
+      ${statRow('Avg accuracy', avgAcc + '%', 'var(--green)')}
+      ${statRow('Avg HP remaining', avgHP + ' HP', 'var(--red)')}
+      ${statRow('Labyrinth runs', labCount, 'var(--purple)')}
+      ${statRow('3D World runs', w3Count, 'var(--gold)')}
+      <div style="margin-top:.9rem;padding:.6rem;background:rgba(0,255,255,.04);
+        border:1px solid rgba(0,255,255,.12);font-size:.7rem;color:var(--muted);line-height:1.6">
+        🔒 <span style="color:var(--cyan)">Privacy-by-design</span> — zero personal data stored.
+        Guardian IDs are auto-assigned pseudonyms. No emails, names, or device identifiers
+        are ever collected or accessible to developers.
+      </div>`;
+  } catch(e) {
+    el.innerHTML = `<div style="color:var(--red);text-align:center;padding:1.5rem;font-size:.78rem;font-family:'Share Tech Mono',monospace">⚠ Could not load analytics.<br><span style="color:var(--muted)">${e.message}</span></div>`;
+  }
+};
+</script>
+<style>
+/* ═══════════ BASE ═══════════ */
+:root{
+  --gold:#C9A84C;--gold2:#FFD97D;
+  --cyan:#00FFFF;--red:#FF2E2E;--green:#00FF88;
+  --purple:#9B30FF;--orange:#FF8C00;
+  --dark:#04080F;--text:#E8DCC8;--muted:#6B7280;
+}
+*{margin:0;padding:0;box-sizing:border-box;}
+html,body{width:100%;height:100%;overflow:hidden;font-family:'Rajdhani',sans-serif;background:#000;color:var(--text);}
+
+/* Screens */
+.screen{position:fixed;inset:0;display:none;flex-direction:column;}
+.screen.active{display:flex;}
+
+/* Scanlines on everything */
+body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:8000;
+  background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,0,0,.06) 2px,rgba(0,0,0,.06) 4px);}
+
+/* ═══════════════════════════════════════
+   INTRO SCREEN — Simple, quick, atmospheric
+═══════════════════════════════════════ */
+#intro{
+  align-items:center;justify-content:center;overflow:hidden;height:100%;
+  background:radial-gradient(ellipse at 50% 35%,#0b1828 0%,#04080F 65%);
+}
+
+/* Slowly rising temple silhouette */
+.temple-silhouette{
+  position:absolute;bottom:0;left:0;right:0;height:45%;
+  background:
+    linear-gradient(180deg,transparent 0%,#000408 100%);
+  clip-path:polygon(
+    0% 100%, 0% 70%, 3% 70%, 3% 55%, 5% 55%, 5% 40%, 7% 40%, 7% 55%, 10% 55%,
+    10% 30%, 12% 30%, 12% 55%, 15% 55%, 15% 70%, 18% 70%, 18% 100%,
+    25% 100%, 25% 60%, 27% 60%, 27% 45%, 29% 45%, 29% 60%, 31% 60%,
+    31% 100%, 69% 100%, 69% 60%, 71% 60%, 71% 45%, 73% 45%, 73% 60%, 75% 60%,
+    75% 100%, 82% 100%, 82% 70%, 85% 70%, 85% 55%, 88% 55%, 88% 30%,
+    90% 30%, 90% 55%, 93% 55%, 93% 70%, 95% 70%, 95% 55%, 97% 55%,
+    97% 40%, 100% 40%, 100% 100%
+  );
+  animation:templeRise 2.5s ease-out forwards;
+  opacity:.6;
+}
+@keyframes templeRise{from{transform:translateY(40px);opacity:0}to{transform:translateY(0);opacity:.6}}
+
+/* Ground glow */
+.ground-glow{
+  position:absolute;bottom:0;left:0;right:0;height:200px;
+  background:radial-gradient(ellipse at 50% 100%,rgba(0,255,255,.08) 0%,transparent 70%);
+  animation:glowBreath 4s ease-in-out infinite;
+}
+@keyframes glowBreath{0%,100%{opacity:.5}50%{opacity:1}}
+
+/* Floating runes */
+.frune{position:absolute;font-family:'Share Tech Mono',monospace;font-size:1rem;
+  color:rgba(201,168,76,.5);animation:runeFloat 10s ease-in-out infinite;}
+@keyframes runeFloat{
+  0%{opacity:0;transform:translateY(15px)}15%{opacity:.7}80%{opacity:.3}100%{opacity:0;transform:translateY(-50px)}
+}
+
+.intro-body{position:relative;z-index:5;text-align:center;padding:1rem;
+  animation:introFadeIn 1.2s ease forwards;}
+@keyframes introFadeIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+
+.emblem{width:90px;height:90px;margin:0 auto 1rem;position:relative;}
+.emblem svg{width:100%;height:100%;animation:emblemSpin 25s linear infinite;}
+.emblem-core{position:absolute;inset:28%;border-radius:50%;
+  background:radial-gradient(circle,var(--gold2),var(--gold));
+  box-shadow:0 0 20px var(--gold),0 0 40px rgba(201,168,76,.3);
+  display:flex;align-items:center;justify-content:center;font-size:1.5rem;
+  animation:corePulse 3s ease-in-out infinite;}
+@keyframes emblemSpin{to{transform:rotate(360deg)}}
+@keyframes corePulse{0%,100%{box-shadow:0 0 20px var(--gold)}50%{box-shadow:0 0 40px var(--gold2)}}
+
+.game-label{font-family:'Share Tech Mono',monospace;font-size:.65rem;
+  letter-spacing:5px;color:var(--cyan);text-shadow:0 0 8px var(--cyan);margin-bottom:.3rem;}
+.game-title{font-family:'Cinzel Decorative',serif;
+  font-size:clamp(2.5rem,10vw,5rem);line-height:1;letter-spacing:4px;
+  background:linear-gradient(160deg,#8a6020 0%,#FFD97D 40%,#C9A84C 60%,#FFD97D 80%,#8a6020 100%);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  filter:drop-shadow(0 0 30px rgba(201,168,76,.4));}
+.game-quote{font-size:.85rem;color:rgba(220,200,160,.6);font-style:italic;
+  margin:.6rem 0 1.8rem;letter-spacing:1px;}
+
+/* THE BUTTON — important, must work */
+.btn-enter-temple{
+  background:linear-gradient(135deg,rgba(15,25,15,1),rgba(25,35,20,1));
+  border:2px solid var(--gold);
+  color:var(--gold2);
+  padding:.85rem 2.8rem;
+  font-family:'Cinzel Decorative',serif;
+  font-size:1rem;
+  letter-spacing:3px;
+  cursor:pointer;
+  position:relative;overflow:hidden;
+  clip-path:polygon(12px 0%,100% 0%,calc(100% - 12px) 100%,0% 100%);
+  transition:box-shadow .3s, color .3s;
+  display:block;
+  margin:0 auto;
+}
+.btn-enter-temple::before{
+  content:'';position:absolute;inset:0;
+  background:linear-gradient(135deg,rgba(201,168,76,.15),transparent);
+  transform:translateX(-100%);transition:transform .35s;
+}
+.btn-enter-temple:hover{box-shadow:0 0 30px rgba(201,168,76,.5);color:#fff;}
+.btn-enter-temple:hover::before{transform:translateX(0);}
+
+.team-label{margin-top:1.5rem;font-size:.6rem;color:var(--muted);
+  font-family:'Share Tech Mono',monospace;letter-spacing:3px;}
+
+/* Transition overlay for intro→hub */
+#transOverlay{
+  position:fixed;inset:0;background:#000;z-index:100;
+  opacity:0;pointer-events:none;transition:opacity .5s ease;
+}
+#transOverlay.fade-in{opacity:1;pointer-events:all;}
+
+/* ═══════════════════════════════════════
+   HUB SCREEN
+═══════════════════════════════════════ */
+#hub{
+  background:radial-gradient(ellipse at 50% -10%,#0f1f0f 0%,#04080F 60%);
+  overflow-y:auto;align-items:center;height:100%;
+}
+.hub-grid{position:fixed;inset:0;pointer-events:none;
+  background-image:linear-gradient(rgba(0,255,136,.018) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,255,136,.018) 1px,transparent 1px);
+  background-size:32px 32px;}
+.hub-inner{position:relative;z-index:1;width:100%;max-width:820px;padding:1rem;
+  display:flex;flex-direction:column;gap:.9rem;}
+
+/* HUD bar */
+.hud{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;
+  background:rgba(8,12,8,.95);border:1px solid rgba(201,168,76,.25);
+  padding:.6rem 1rem;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%);}
+.hud-av{width:44px;height:44px;flex-shrink:0;border:2px solid var(--gold);
+  display:flex;align-items:center;justify-content:center;
+  background:linear-gradient(135deg,#1a2a3a,#0d1a2a);}
+.hud-info{flex:1;min-width:100px;}
+.hud-name{font-family:'Cinzel Decorative',serif;font-size:.8rem;color:var(--gold2);}
+.hud-role{font-size:.6rem;color:var(--muted);letter-spacing:2px;}
+.stat-block{display:flex;flex-direction:column;gap:4px;min-width:140px;}
+.srow{display:flex;align-items:center;gap:.4rem;}
+.si{font-size:.75rem;width:16px;text-align:center;}
+.btrack{flex:1;height:7px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden;}
+.bfill{height:100%;border-radius:2px;transition:width .5s;}
+.bfill.hp{background:linear-gradient(90deg,#cc0000,#ff4444);}
+.bfill.xp{background:linear-gradient(90deg,#cc8800,#ffd700);}
+.bval{font-size:.6rem;color:var(--muted);width:48px;text-align:right;font-family:'Share Tech Mono',monospace;}
+.coin-badge{display:flex;align-items:center;gap:.3rem;
+  background:rgba(201,168,76,.1);border:1px solid rgba(201,168,76,.25);padding:.3rem .6rem;}
+.coin-badge span{font-family:'Cinzel Decorative',serif;font-size:.9rem;color:var(--gold2);}
+
+.section-title{font-family:'Cinzel Decorative',serif;font-size:1rem;
+  color:var(--gold);text-align:center;letter-spacing:3px;}
+.section-sub{font-size:.72rem;color:var(--muted);text-align:center;letter-spacing:2px;margin-top:.2rem;}
+
+/* Realm cards */
+.realm-list{display:flex;flex-direction:column;gap:.7rem;}
+.rcard{display:flex;align-items:stretch;background:rgba(8,12,8,.96);
+  border:1px solid rgba(255,255,255,.07);cursor:pointer;transition:all .22s;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%);}
+.rcard:hover{transform:translateX(5px);border-color:var(--gold);
+  box-shadow:0 0 20px rgba(201,168,76,.1);}
+.rcard-accent{width:4px;flex-shrink:0;}
+.ra-1{background:linear-gradient(180deg,var(--cyan),var(--purple));}
+.ra-2{background:linear-gradient(180deg,var(--gold),#ff8c00);}
+.ra-3{background:linear-gradient(180deg,var(--green),#00aa55);}
+.rcard-icon{width:88px;min-height:88px;flex-shrink:0;display:flex;align-items:center;
+  justify-content:center;font-size:2.6rem;background:rgba(0,0,0,.3);}
+.rcard-body{padding:.85rem;flex:1;}
+.rcard-num{font-size:.58rem;color:var(--muted);letter-spacing:3px;
+  text-transform:uppercase;font-family:'Share Tech Mono',monospace;}
+.rcard-name{font-family:'Cinzel Decorative',serif;font-size:.92rem;color:var(--gold2);margin:.18rem 0;}
+.rcard-desc{font-size:.76rem;color:var(--muted);line-height:1.5;}
+.rcard-tags{display:flex;gap:.3rem;margin-top:.4rem;flex-wrap:wrap;}
+.rtag{font-size:.57rem;padding:.12rem .4rem;font-weight:700;
+  letter-spacing:1px;text-transform:uppercase;font-family:'Share Tech Mono',monospace;border-radius:2px;}
+.rt-go{background:rgba(0,255,136,.15);color:var(--green);border:1px solid rgba(0,255,136,.3);}
+.rt-xp{background:rgba(255,215,0,.1);color:#ffd700;border:1px solid rgba(255,215,0,.25);}
+.rt-hard{background:rgba(255,46,46,.15);color:var(--red);border:1px solid rgba(255,46,46,.3);}
+.rt-ai{background:rgba(201,168,76,.1);color:var(--gold);border:1px solid rgba(201,168,76,.25);}
+.rcard-arrow{padding:.85rem;display:flex;align-items:center;justify-content:center;flex-shrink:0;}
+.arr{width:32px;height:32px;border:2px solid var(--gold);
+  display:flex;align-items:center;justify-content:center;color:var(--gold);
+  transition:all .22s;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 7px),calc(100% - 7px) 100%,0 100%);}
+.rcard:hover .arr{background:var(--gold);color:#000;}
+
+/* ═══════════════════════════════════════
+   LABYRINTH SCREEN
+═══════════════════════════════════════ */
+#labyrinth{background:#000;height:100%;position:relative;}
+
+/* The full-screen first-person view */
+#fpScene{position:absolute;top:0;left:0;width:100%;height:100%;display:flex;flex-direction:column;overflow:hidden;}
+
+/* Ceiling — top 55% */
+#fpCeil{
+  flex:0 0 55%;position:relative;overflow:hidden;
+  background:linear-gradient(180deg,#000408 0%,#020b18 55%,#050d20 100%);
+}
+.wall-l{position:absolute;top:0;bottom:0;left:0;width:36%;
+  background:linear-gradient(90deg,#000205 0%,#07101e 55%,#0c1828 100%);
+  border-right:2px solid rgba(0,255,255,.1);}
+.wall-r{position:absolute;top:0;bottom:0;right:0;width:36%;
+  background:linear-gradient(270deg,#000205 0%,#07101e 55%,#0c1828 100%);
+  border-left:2px solid rgba(0,255,255,.1);}
+.wall-l::after,.wall-r::after{content:'';position:absolute;inset:0;
+  background:
+    repeating-linear-gradient(0deg,transparent 0,transparent 39px,rgba(0,255,255,.04) 39px,rgba(0,255,255,.04) 40px),
+    repeating-linear-gradient(90deg,transparent 0,transparent 59px,rgba(0,255,255,.03) 59px,rgba(0,255,255,.03) 60px);}
+.rune-strip{position:absolute;height:2px;opacity:.3;
+  background:linear-gradient(90deg,transparent,var(--cyan),transparent);
+  animation:rStrip 3s ease-in-out infinite;}
+.rs-l{top:34%;left:0;right:33%;}.rs-r{top:34%;left:33%;right:0;animation-delay:1.5s;}
+@keyframes rStrip{0%,100%{opacity:.15}50%{opacity:.6}}
+.vp-dot{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+  width:80px;height:80px;border-radius:50%;
+  background:radial-gradient(circle,rgba(0,255,255,.07),transparent 70%);
+  animation:vpP 4s ease-in-out infinite;}
+@keyframes vpP{0%,100%{opacity:.4}50%{opacity:1}}
+.ceil-lines{position:absolute;inset:0;
+  background:linear-gradient(rgba(0,255,255,.03) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,255,255,.03) 1px,transparent 1px);
+  background-size:44px 44px;opacity:.6;}
+
+/* Floor — bottom 45% */
+#fpFloor{
+  flex:0 0 45%;position:relative;overflow:hidden;
+  background:linear-gradient(180deg,#050d20 0%,#020810 100%);
+}
+.floor-grid{position:absolute;inset:0;
+  background:linear-gradient(rgba(0,255,255,.04) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,255,255,.04) 1px,transparent 1px);
+  background-size:80px 40px;
+  transform:perspective(260px) rotateX(55deg);transform-origin:top center;}
+
+/* Depth flash on step */
+.depth-pulse{position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(ellipse at 50% 50%,rgba(0,255,255,.05),transparent 60%);
+  opacity:0;transition:opacity .08s;}
+.depth-pulse.flash{opacity:1;}
+
+/* ─── FIRST-PERSON BODY ─── */
+#fpBody{position:absolute;bottom:0;left:0;right:0;height:50%;pointer-events:none;z-index:15;}
+#fpBody svg{width:100%;height:100%;display:block;}
+/* Arm bob on step */
+#fpBody.bob{animation:armBob .22s ease-out;}
+@keyframes armBob{0%{transform:translateY(0)}45%{transform:translateY(-9px)}100%{transform:translateY(0)}}
+/* Glows */
+@keyframes runeGlow{0%,100%{opacity:.4}50%{opacity:1;filter:drop-shadow(0 0 8px #00ffff)}}
+@keyframes orbPulse{0%,100%{opacity:.5}50%{opacity:1;filter:drop-shadow(0 0 14px #ff6600)}}
+@keyframes chainAnim{0%,100%{stroke-opacity:.3}50%{stroke-opacity:.8}}
+
+/* ─── HUD OVERLAY ─── */
+#labHud{position:absolute;top:0;left:0;right:0;z-index:20;
+  display:flex;justify-content:space-between;align-items:flex-start;
+  padding:.6rem .75rem;pointer-events:none;}
+.hud-stats{background:rgba(0,0,0,.82);border:1px solid rgba(201,168,76,.22);
+  padding:.5rem .7rem;display:flex;flex-direction:column;gap:5px;min-width:132px;pointer-events:all;}
+.minimap{width:72px;height:72px;background:rgba(0,0,0,.85);
+  border:1px solid rgba(0,255,255,.3);position:relative;overflow:hidden;pointer-events:all;}
+.mm-grid{position:absolute;inset:0;
+  background:linear-gradient(rgba(0,255,255,.14) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(0,255,255,.14) 1px,transparent 1px);
+  background-size:18px 18px;}
+.mm-player{position:absolute;width:6px;height:6px;border-radius:50%;
+  background:var(--cyan);box-shadow:0 0 6px var(--cyan);
+  transition:all .6s ease;transform:translate(-50%,-50%);}
+
+/* Trail */
+#trailBar{position:absolute;bottom:.75rem;left:50%;transform:translateX(-50%);
+  z-index:20;display:flex;gap:.4rem;align-items:center;
+  background:rgba(0,0,0,.82);padding:.32rem .65rem;
+  border:1px solid rgba(255,255,255,.07);}
+.tdot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.14);transition:all .4s;}
+.tdot.done{background:var(--green);box-shadow:0 0 6px var(--green);}
+.tdot.now{background:var(--cyan);box-shadow:0 0 6px var(--cyan);width:18px;border-radius:4px;}
+.tdot.boss-dot{border:1px solid var(--red);background:rgba(255,46,46,.2);}
+.tdot.boss-dot.now{background:var(--red);box-shadow:0 0 6px var(--red);}
+
+/* Move prompt */
+#movePrompt{position:absolute;bottom:2.8rem;left:50%;transform:translateX(-50%);
+  z-index:22;pointer-events:none;
+  animation:promptBob 1.8s ease-in-out infinite;}
+@keyframes promptBob{0%,100%{opacity:.55;transform:translateX(-50%) translateY(0)}50%{opacity:1;transform:translateX(-50%) translateY(-5px)}}
+.prompt-box{background:rgba(0,0,0,.88);border:1px solid rgba(201,168,76,.45);
+  padding:.45rem 1.1rem;display:flex;align-items:center;gap:.7rem;
+  clip-path:polygon(8px 0%,100% 0%,calc(100% - 8px) 100%,0% 100%);}
+.prompt-key{width:30px;height:30px;background:rgba(201,168,76,.15);
+  border:2px solid var(--gold);border-radius:4px;border-bottom-width:4px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:'Cinzel Decorative',serif;font-size:.85rem;color:var(--gold2);}
+.prompt-txt{font-family:'Share Tech Mono',monospace;font-size:.65rem;color:var(--muted);letter-spacing:2px;}
+
+/* Back button */
+#labBack{position:absolute;bottom:.75rem;right:.75rem;z-index:25;
+  background:rgba(0,0,0,.85);border:1px solid rgba(201,168,76,.28);
+  color:var(--gold);padding:.38rem .85rem;font-family:'Rajdhani',sans-serif;
+  font-size:.78rem;font-weight:700;cursor:pointer;letter-spacing:2px;}
+
+/* ─── ENCOUNTER MODAL ─── */
+#encModal{position:absolute;inset:0;z-index:50;background:rgba(0,0,0,.94);
+  display:none;align-items:center;justify-content:center;padding:.75rem;overflow-y:auto;
+  animation:fadeUp .3s ease;}
+@keyframes fadeUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+.enc-box{width:100%;max-width:600px;background:linear-gradient(180deg,#0a1018,#050d14);
+  border:1px solid rgba(201,168,76,.38);overflow:hidden;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 16px),calc(100% - 16px) 100%,0 100%);}
+.enc-hd{background:linear-gradient(90deg,rgba(201,168,76,.18),transparent);
+  padding:.65rem 1rem;border-bottom:1px solid rgba(201,168,76,.12);
+  display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;}
+.enc-icon{font-size:2rem;}
+.enc-type{font-size:.56rem;color:var(--cyan);letter-spacing:3px;text-transform:uppercase;
+  font-family:'Share Tech Mono',monospace;}
+.enc-name{font-family:'Cinzel Decorative',serif;font-size:.9rem;color:var(--gold2);}
+.enc-threat{margin-left:auto;font-size:.58rem;padding:.15rem .5rem;
+  font-family:'Share Tech Mono',monospace;font-weight:700;border-radius:2px;}
+.th-hi{background:rgba(255,140,0,.2);color:var(--orange);border:1px solid rgba(255,140,0,.4);}
+.th-cr{background:rgba(255,46,46,.2);color:var(--red);border:1px solid rgba(255,46,46,.4);}
+.th-boss{background:rgba(155,48,255,.2);color:var(--purple);border:1px solid rgba(155,48,255,.4);
+  animation:bossThreat 1s ease-in-out infinite;}
+@keyframes bossThreat{0%,100%{box-shadow:0 0 4px rgba(155,48,255,.4)}50%{box-shadow:0 0 14px rgba(155,48,255,.8)}}
+.monster-arena{background:linear-gradient(180deg,#050d1a,#020810);
+  padding:1rem 1rem .75rem;display:flex;align-items:center;gap:1rem;
+  border-bottom:1px solid rgba(255,255,255,.04);}
+.m-sprite{width:96px;height:96px;flex-shrink:0;position:relative;overflow:hidden;
+  border:2px solid rgba(201,168,76,.22);
+  background:radial-gradient(circle,#120808,#060208);}
+.m-sprite::before{content:'';position:absolute;inset:0;
+  background:repeating-linear-gradient(0deg,transparent,transparent 3px,rgba(255,0,0,.04) 3px,rgba(255,0,0,.04) 4px);
+  animation:scanlines .4s linear infinite;}
+@keyframes scanlines{0%{background-position:0 0}100%{background-position:0 4px}}
+.m-sprite svg{position:relative;z-index:1;width:80px;height:80px;display:block;margin:8px auto;}
+.m-hpbar{margin-top:.4rem;}
+.m-hpbar-lbl{font-size:.52rem;color:var(--muted);font-family:'Share Tech Mono',monospace;margin-bottom:2px;}
+.m-hpbar-track{height:5px;background:rgba(255,255,255,.1);border-radius:1px;overflow:hidden;}
+.m-hpbar-fill{height:100%;background:linear-gradient(90deg,#880000,var(--red));transition:width .8s;}
+.m-info{flex:1;}
+.m-name{font-family:'Cinzel Decorative',serif;font-size:.88rem;color:var(--red);margin-bottom:.3rem;}
+.m-badge{display:inline-block;font-size:.58rem;padding:.12rem .4rem;border-radius:2px;
+  margin-bottom:.3rem;font-family:'Share Tech Mono',monospace;font-weight:700;}
+.mb-phish{background:rgba(255,140,0,.18);color:var(--orange);border:1px solid rgba(255,140,0,.4);}
+.mb-mimic{background:rgba(0,255,255,.1);color:var(--cyan);border:1px solid rgba(0,255,255,.3);}
+.mb-brute{background:rgba(155,48,255,.18);color:var(--purple);border:1px solid rgba(155,48,255,.4);}
+.mb-mal{background:rgba(255,46,46,.18);color:var(--red);border:1px solid rgba(255,46,46,.4);}
+.m-desc{font-size:.76rem;color:#99aaaa;line-height:1.6;}
+.enc-sit{padding:.75rem 1rem;font-size:.83rem;color:#9aabb0;line-height:1.7;
+  border-bottom:1px solid rgba(255,255,255,.04);font-style:italic;}
+.enc-q{padding:.6rem 1rem .4rem;font-weight:700;font-size:.88rem;color:var(--gold2);}
+.boss-rule{margin:.35rem 1rem;background:rgba(155,48,255,.07);
+  border:1px solid rgba(155,48,255,.28);padding:.55rem .75rem;
+  font-size:.76rem;color:#c084fc;line-height:1.5;}
+.routes{padding:0 1rem 1rem;display:flex;flex-direction:column;gap:.4rem;}
+.rbtn{background:rgba(18,24,18,.95);border:1px solid rgba(255,255,255,.07);
+  padding:.65rem .85rem;cursor:pointer;color:var(--text);
+  font-family:'Rajdhani',sans-serif;font-size:.84rem;font-weight:600;
+  text-align:left;transition:all .2s;display:flex;align-items:center;gap:.65rem;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 6px),calc(100% - 6px) 100%,0 100%);}
+.rbtn:hover:not(:disabled){border-color:var(--cyan);background:rgba(0,255,255,.05);transform:translateX(3px);}
+.rbtn.correct{border-color:var(--green)!important;background:rgba(0,255,136,.07)!important;}
+.rbtn.wrong{border-color:var(--red)!important;background:rgba(255,46,46,.07)!important;}
+.rbtn:disabled{cursor:default;}
+.rlbl{width:24px;height:24px;background:rgba(255,255,255,.05);
+  border:1px solid rgba(255,255,255,.1);display:flex;align-items:center;
+  justify-content:center;font-family:'Cinzel Decorative',serif;font-size:.72rem;color:var(--gold);flex-shrink:0;}
+
+/* Consequence */
+#conOverlay{position:absolute;inset:0;z-index:60;background:rgba(0,0,0,.96);
+  display:none;align-items:center;justify-content:center;padding:1rem;animation:fadeUp .3s ease;}
+.con-box{width:100%;max-width:460px;text-align:center;}
+.con-title{font-family:'Cinzel Decorative',serif;font-size:clamp(1.4rem,5vw,2rem);
+  color:var(--red);letter-spacing:3px;text-shadow:0 0 30px rgba(255,46,46,.8);
+  animation:glitch .3s ease;margin-bottom:.25rem;}
+@keyframes glitch{0%{transform:translateX(0)}20%{transform:translateX(-4px) skewX(4deg)}50%{transform:translateX(4px)}100%{transform:translateX(0)}}
+.con-emoji{font-size:4rem;margin:.7rem auto;display:block;animation:floatEmoji 2s ease-in-out infinite;}
+@keyframes floatEmoji{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+.pen-row{display:flex;gap:.45rem;justify-content:center;flex-wrap:wrap;margin:.65rem 0;}
+.pen{background:rgba(255,46,46,.14);border:1px solid rgba(255,46,46,.38);
+  color:var(--red);font-size:.66rem;padding:.22rem .5rem;
+  font-family:'Share Tech Mono',monospace;border-radius:2px;}
+.con-learn{background:rgba(0,255,255,.05);border-left:3px solid var(--cyan);
+  padding:.6rem .85rem;text-align:left;font-size:.78rem;color:#8cf;
+  border-radius:0 4px 4px 0;margin:.65rem 0;line-height:1.6;}
+.con-btns{display:flex;gap:.65rem;justify-content:center;flex-wrap:wrap;margin-top:.75rem;}
+.cbtn{background:transparent;border:2px solid var(--red);color:var(--red);
+  padding:.5rem 1.4rem;font-family:'Cinzel Decorative',serif;font-size:.78rem;
+  cursor:pointer;letter-spacing:2px;
+  clip-path:polygon(8px 0%,100% 0%,calc(100% - 8px) 100%,0% 100%);transition:all .2s;}
+.cbtn:hover{background:var(--red);color:#fff;}
+.cbtn.g{border-color:var(--green);color:var(--green);}
+.cbtn.g:hover{background:var(--green);color:#000;}
+
+/* Victory */
+#labVic{position:absolute;inset:0;z-index:60;background:rgba(0,0,0,.95);
+  display:none;align-items:center;justify-content:center;padding:1rem;animation:fadeUp .5s ease;}
+.vic-box{text-align:center;width:100%;max-width:460px;}
+.vic-title{font-family:'Cinzel Decorative',serif;font-size:clamp(1.4rem,5vw,2.2rem);
+  color:var(--gold2);letter-spacing:3px;text-shadow:0 0 40px rgba(201,168,76,.8);}
+.vic-trophy{font-size:5rem;display:block;margin:.8rem 0;
+  animation:trophyPulse 1s ease-in-out infinite alternate;
+  filter:drop-shadow(0 0 10px var(--gold));}
+@keyframes trophyPulse{to{filter:drop-shadow(0 0 30px var(--gold2))}}
+.vic-card{background:rgba(10,14,10,.96);border:1px solid rgba(201,168,76,.28);
+  padding:1rem;margin:.85rem 0;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%);}
+.vrow{display:flex;justify-content:space-between;padding:.38rem 0;
+  border-bottom:1px solid rgba(255,255,255,.04);font-size:.84rem;}
+.vrow:last-child{border:none;}
+.vrow span:first-child{color:var(--muted);}
+.vrow span:last-child{font-family:'Cinzel Decorative',serif;font-size:.88rem;}
+
+/* Screen shake */
+#fpScene.shake{animation:sceneShake .35s ease;}
+@keyframes sceneShake{0%{transform:translateX(0)}20%{transform:translateX(-7px)}50%{transform:translateX(7px)}80%{transform:translateX(-4px)}100%{transform:translateX(0)}}
+
+/* ═══════════════════════════════════════
+   LABYRINTH OPENING CINEMATIC
+═══════════════════════════════════════ */
+#labOpening{
+  position:absolute;inset:0;z-index:80;background:#000;
+  display:flex;align-items:center;justify-content:center;overflow:hidden;
+}
+
+/* Gate panels */
+.gate-l,.gate-r{
+  position:absolute;top:0;bottom:0;width:50%;
+  display:flex;align-items:center;overflow:hidden;
+  transition:transform 3s cubic-bezier(.55,0,.1,1);
+}
+.gate-l{right:50%;background:linear-gradient(90deg,#000204 0%,#060d18 70%,#0c1828 100%);
+  border-right:3px solid rgba(201,168,76,.55);justify-content:flex-end;padding-right:1.5rem;}
+.gate-r{left:50%;background:linear-gradient(270deg,#000204 0%,#060d18 70%,#0c1828 100%);
+  border-left:3px solid rgba(201,168,76,.55);justify-content:flex-start;padding-left:1.5rem;}
+.gate-l.open{transform:translateX(-100%);}
+.gate-r.open{transform:translateX(100%);}
+
+/* Gate face decorations */
+.gate-face{display:flex;flex-direction:column;gap:1rem;align-items:center;}
+.gate-emblem{width:56px;height:56px;border-radius:50%;
+  border:2px solid rgba(201,168,76,.4);display:flex;align-items:center;justify-content:center;
+  font-size:1.7rem;background:rgba(201,168,76,.05);animation:gEmblem 6s linear infinite;}
+@keyframes gEmblem{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+.gate-runes-col{display:flex;flex-direction:column;gap:.55rem;}
+.grune{width:30px;height:30px;border:1px solid rgba(201,168,76,.28);
+  display:flex;align-items:center;justify-content:center;
+  font-family:'Share Tech Mono',monospace;font-size:.95rem;
+  color:rgba(201,168,76,.55);background:rgba(201,168,76,.04);
+  animation:gRuneFlicker 3s ease-in-out infinite;}
+@keyframes gRuneFlicker{0%,100%{opacity:.35}50%{opacity:.85;box-shadow:0 0 6px rgba(201,168,76,.3)}}
+.grune:nth-child(2){animation-delay:.5s;}.grune:nth-child(3){animation-delay:1s;}
+.grune:nth-child(4){animation-delay:1.5s;}.grune:nth-child(5){animation-delay:2s;}
+.gate-vbar{width:3px;height:60px;
+  background:linear-gradient(180deg,transparent,rgba(201,168,76,.5),transparent);
+  animation:vbarP 2.5s ease-in-out infinite;}
+@keyframes vbarP{0%,100%{opacity:.2}50%{opacity:.8}}
+
+/* Cinematic text layers */
+.open-layer{
+  position:absolute;inset:0;z-index:5;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:.35rem;padding:0 2.5rem;pointer-events:none;
+}
+
+/* Scan line */
+.open-scan{position:absolute;left:0;right:0;height:2px;top:-2px;
+  background:linear-gradient(90deg,transparent,rgba(0,255,255,.5),transparent);
+  box-shadow:0 0 10px rgba(0,255,255,.3);}
+.open-scan.sweep{animation:scanDown 3s ease-in-out forwards;}
+@keyframes scanDown{0%{top:-2px;opacity:0}8%{opacity:1}90%{opacity:.5}100%{top:100%;opacity:0}}
+
+/* Fog */
+.open-fog{position:absolute;inset:0;pointer-events:none;opacity:0;
+  background:radial-gradient(ellipse at 50% 80%,rgba(0,15,30,.7) 0%,transparent 60%),
+    radial-gradient(ellipse at 20% 40%,rgba(5,0,20,.5) 0%,transparent 50%);
+  transition:opacity 3s ease;}
+
+/* Vignette */
+.open-vig{position:absolute;inset:0;pointer-events:none;opacity:0;
+  background:radial-gradient(ellipse at 50% 50%,transparent 35%,rgba(0,0,0,.85) 100%);
+  transition:opacity 2.5s ease;}
+
+/* Individual text elements — all start hidden */
+.o-location{font-family:'Share Tech Mono',monospace;font-size:.62rem;
+  letter-spacing:6px;color:rgba(201,168,76,.45);opacity:0;transition:opacity 2.5s ease;}
+.o-divider{width:0;height:1px;
+  background:linear-gradient(90deg,transparent,rgba(201,168,76,.6),transparent);
+  box-shadow:0 0 6px rgba(201,168,76,.3);transition:width 2.2s ease;margin:.5rem 0;}
+.o-title{font-family:'Cinzel Decorative',serif;
+  font-size:clamp(1.2rem,3.5vw,2rem);color:var(--gold2);
+  text-align:center;letter-spacing:4px;line-height:1.9;
+  opacity:0;transform:translateY(12px);
+  transition:opacity 2.5s ease,transform 2.5s ease;
+  text-shadow:0 0 40px rgba(201,168,76,.5);}
+.o-narr{font-family:'Rajdhani',sans-serif;font-size:clamp(.82rem,2vw,.97rem);
+  color:rgba(218,195,160,.7);text-align:center;letter-spacing:1.5px;
+  font-style:italic;font-weight:500;line-height:1.8;
+  opacity:0;transform:translateY(8px);
+  transition:opacity 2.2s ease,transform 2.2s ease;}
+.o-sub{font-family:'Share Tech Mono',monospace;font-size:.7rem;color:var(--cyan);
+  letter-spacing:3px;text-align:center;opacity:0;
+  text-shadow:0 0 10px rgba(0,255,255,.6);transition:opacity 2s ease;}
+.o-enter{font-family:'Cinzel Decorative',serif;
+  font-size:clamp(3rem,10vw,6rem);letter-spacing:14px;
+  background:linear-gradient(135deg,#7a5010,#FFD97D,#C9A84C,#FFD97D,#7a5010);
+  background-size:200% auto;-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+  animation:goldShimmer 2.5s linear infinite;
+  opacity:0;transition:opacity 2s ease;
+  filter:drop-shadow(0 0 25px rgba(201,168,76,.5));}
+@keyframes goldShimmer{0%{background-position:0%}100%{background-position:200%}}
+
+/* Skip button */
+#skipBtn{position:absolute;bottom:1.2rem;right:1.2rem;z-index:10;
+  background:transparent;border:1px solid rgba(201,168,76,.25);
+  color:rgba(201,168,76,.45);padding:.3rem .8rem;
+  font-family:'Share Tech Mono',monospace;font-size:.6rem;letter-spacing:2px;
+  cursor:pointer;transition:all .3s;opacity:0;animation:skipAppear 1s ease 4s forwards;}
+@keyframes skipAppear{to{opacity:1;}}
+#skipBtn:hover{color:var(--gold2);border-color:var(--gold);}
+
+/* ═══════════════════════════════════════
+   TAVERN
+═══════════════════════════════════════ */
+#tavern{background:linear-gradient(180deg,#0c0705,#181005 50%,#0c0705);overflow:hidden;height:100%;}
+.tav-wrap{position:relative;width:100%;max-width:680px;margin:0 auto;
+  height:100%;display:flex;flex-direction:column;padding:.75rem;}
+.torch{position:absolute;display:flex;flex-direction:column;align-items:center;}
+.torch-f{font-size:1.4rem;animation:tFlick .5s ease-in-out infinite alternate;}
+@keyframes tFlick{from{transform:scale(1) rotate(-3deg)}to{transform:scale(1.1) rotate(3deg)}}
+.torch-g{position:absolute;width:65px;height:65px;border-radius:50%;
+  background:radial-gradient(circle,rgba(255,140,0,.28),transparent);
+  top:-14px;left:50%;transform:translateX(-50%);animation:tFlick .5s ease-in-out infinite alternate;}
+.tl{top:5%;left:5%;}.tr{top:5%;right:5%;}
+.noticeboard{background:#291908;border:3px solid #5a3a18;padding:.6rem;
+  position:absolute;top:12%;right:2%;width:115px;transform:rotate(2deg);
+  box-shadow:4px 4px 10px rgba(0,0,0,.5);}
+.nb-ttl{font-family:'Cinzel Decorative',serif;font-size:.52rem;color:var(--gold);
+  text-align:center;margin-bottom:.35rem;letter-spacing:1px;}
+.nb-item{background:rgba(201,168,76,.08);border:1px solid rgba(201,168,76,.18);
+  padding:.22rem .32rem;margin-bottom:.22rem;font-size:.56rem;color:#cca;
+  line-height:1.4;transform:rotate(-1deg);}
+.tav-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:.65rem;}
+.tav-ttl{font-family:'Cinzel Decorative',serif;font-size:.95rem;color:var(--gold);letter-spacing:2px;}
+.bart-scene{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+.bart-visual{display:flex;align-items:flex-end;justify-content:center;padding-top:.5rem;
+  background:linear-gradient(180deg,transparent,rgba(201,168,76,.04));
+  border-bottom:3px solid #2a1a08;position:relative;min-height:130px;}
+.bar-top{position:absolute;bottom:0;left:0;right:0;height:32px;
+  background:linear-gradient(180deg,#5a3818,#3d2810);border-top:3px solid #8a5a28;}
+.bottles{position:absolute;bottom:32px;right:12px;display:flex;gap:.3rem;align-items:flex-end;}
+.bott{font-size:1rem;}
+.bart-char{position:relative;display:flex;flex-direction:column;align-items:center;
+  animation:bartBreath 4s ease-in-out infinite;margin-bottom:32px;}
+@keyframes bartBreath{0%,100%{transform:translateY(0)}50%{transform:translateY(-3px)}}
+.chat-area{flex:1;display:flex;flex-direction:column;overflow:hidden;
+  background:rgba(0,0,0,.48);border:1px solid rgba(201,168,76,.13);margin-top:.55rem;}
+.chat-msgs{flex:1;overflow-y:auto;padding:.6rem;display:flex;flex-direction:column;gap:.4rem;
+  scrollbar-width:thin;scrollbar-color:rgba(201,168,76,.25) transparent;}
+.cmsg{display:flex;gap:.45rem;align-items:flex-start;}
+.cmsg.me{flex-direction:row-reverse;}
+.cav{width:24px;height:24px;border-radius:2px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;font-size:.9rem;}
+.cav.b{background:rgba(201,168,76,.12);border:1px solid rgba(201,168,76,.22);}
+.cav.p{background:rgba(0,255,255,.07);border:1px solid rgba(0,255,255,.18);}
+.cbub{max-width:78%;padding:.42rem .62rem;font-size:.78rem;line-height:1.5;border-radius:2px;}
+.cbub.b{background:rgba(201,168,76,.07);border:1px solid rgba(201,168,76,.16);color:var(--gold2);}
+.cbub.p{background:rgba(0,255,255,.05);border:1px solid rgba(0,255,255,.16);color:var(--cyan);}
+.ctyping{color:var(--muted);font-style:italic;font-size:.76rem;padding:.32rem .62rem;}
+.chat-in-row{display:flex;border-top:1px solid rgba(201,168,76,.11);padding:.42rem;}
+.cinput{flex:1;background:rgba(0,0,0,.5);border:1px solid rgba(201,168,76,.18);
+  color:var(--gold2);padding:.42rem .65rem;font-family:'Rajdhani',sans-serif;
+  font-size:.83rem;outline:none;transition:border-color .2s;}
+.cinput:focus{border-color:var(--gold);}
+.cinput::placeholder{color:var(--muted);}
+.csend{background:rgba(201,168,76,.13);border:1px solid rgba(201,168,76,.32);
+  color:var(--gold2);padding:.42rem .85rem;cursor:pointer;font-family:'Rajdhani',sans-serif;
+  font-weight:700;font-size:.83rem;letter-spacing:1px;transition:all .2s;}
+.csend:hover{background:rgba(201,168,76,.28);}
+
+/* ═══════════════════════════════════════
+   GUILD
+═══════════════════════════════════════ */
+#guild{background:linear-gradient(180deg,#050f07,#0a1a0e 50%,#050f07);
+  overflow-y:auto;align-items:center;height:100%;}
+.guild-wrap{width:100%;max-width:680px;padding:.9rem;display:flex;flex-direction:column;gap:.85rem;}
+.guild-hdr{display:flex;align-items:center;justify-content:space-between;
+  padding:.65rem .95rem;background:rgba(0,255,136,.04);
+  border:1px solid rgba(0,255,136,.18);
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%);}
+.guild-ttl{font-family:'Cinzel Decorative',serif;font-size:.95rem;color:var(--green);letter-spacing:2px;}
+.g-sec-ttl{font-family:'Cinzel Decorative',serif;font-size:.68rem;color:var(--green);
+  letter-spacing:3px;text-transform:uppercase;margin-bottom:.42rem;
+  padding-bottom:.32rem;border-bottom:1px solid rgba(0,255,136,.16);}
+.shop-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(138px,1fr));gap:.5rem;}
+.sitem{background:rgba(0,0,0,.58);border:1px solid rgba(0,255,136,.12);padding:.65rem;
+  cursor:pointer;transition:all .2s;text-align:center;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 8px),calc(100% - 8px) 100%,0 100%);}
+.sitem:hover:not(.locked){border-color:var(--green);background:rgba(0,255,136,.05);transform:translateY(-2px);}
+.sitem.locked{opacity:.38;cursor:not-allowed;}
+.si-icon{font-size:1.8rem;margin-bottom:.3rem;}
+.si-name{font-family:'Cinzel Decorative',serif;font-size:.6rem;color:var(--green);margin-bottom:.18rem;}
+.si-desc{font-size:.6rem;color:var(--muted);line-height:1.4;margin-bottom:.32rem;}
+.si-cost{display:flex;align-items:center;justify-content:center;gap:.28rem;
+  font-family:'Share Tech Mono',monospace;font-size:.68rem;color:var(--gold2);}
+.qlist{display:flex;flex-direction:column;gap:.42rem;}
+.qitem{background:rgba(0,0,0,.58);border:1px solid rgba(0,255,136,.09);
+  padding:.65rem .85rem;display:flex;align-items:center;gap:.85rem;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 6px),calc(100% - 6px) 100%,0 100%);}
+.qi-icon{font-size:1.6rem;flex-shrink:0;}
+.qi-info{flex:1;}
+.qi-name{font-family:'Cinzel Decorative',serif;font-size:.76rem;color:var(--gold2);margin-bottom:.14rem;}
+.qi-desc{font-size:.68rem;color:var(--muted);}
+.qi-reward{font-size:.6rem;color:var(--green);margin-top:.12rem;font-family:'Share Tech Mono',monospace;}
+.qi-status{font-size:.56rem;padding:.16rem .42rem;border-radius:2px;font-weight:700;white-space:nowrap;}
+.qs-new{background:rgba(0,255,136,.13);color:var(--green);border:1px solid rgba(0,255,136,.28);}
+.qs-lk{background:rgba(255,255,255,.04);color:var(--muted);border:1px solid rgba(255,255,255,.09);}
+
+/* ═══════════════════════════════════════
+   SHARED UTILS
+═══════════════════════════════════════ */
+.btn-back{background:transparent;border:1px solid rgba(201,168,76,.35);color:var(--gold);
+  padding:.35rem .85rem;font-family:'Rajdhani',sans-serif;font-weight:700;
+  font-size:.76rem;cursor:pointer;letter-spacing:2px;transition:all .2s;}
+.btn-back:hover{background:rgba(201,168,76,.09);}
+.toast{position:fixed;bottom:2rem;left:50%;transform:translateX(-50%);
+  background:rgba(0,0,0,.97);border:1px solid var(--gold);color:var(--gold2);
+  padding:.52rem 1.3rem;z-index:9998;font-family:'Share Tech Mono',monospace;
+  font-size:.76rem;clip-path:polygon(8px 0%,100% 0%,calc(100% - 8px) 100%,0% 100%);
+  animation:fadeUp .3s ease;}
+::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:rgba(201,168,76,.28);border-radius:2px;}
+
+/* ═══════════════════════════════════════
+   WORLD 3D SCREEN
+═══════════════════════════════════════ */
+#world3d{background:#000;position:relative;overflow:hidden;}
+#world3d canvas{display:block;width:100%!important;height:100%!important;}
+#w3d-hud{position:absolute;top:0;left:0;right:0;z-index:10;
+  display:flex;justify-content:space-between;align-items:flex-start;
+  padding:.6rem .8rem;pointer-events:none;}
+.w3d-block{background:rgba(4,8,15,.88);border:1px solid rgba(201,168,76,.2);
+  padding:.45rem .7rem;min-width:130px;pointer-events:all;}
+.w3d-row{display:flex;align-items:center;gap:.4rem;margin-bottom:3px;}
+.w3d-bar{flex:1;height:6px;background:rgba(255,255,255,.08);border-radius:2px;overflow:hidden;}
+.w3d-fill{height:100%;border-radius:2px;transition:width .4s;}
+.wf-hp{background:linear-gradient(90deg,#881111,#ff3333);}
+.wf-xp{background:linear-gradient(90deg,#886600,#ffd700);}
+.w3d-val{font-size:.62rem;color:var(--muted);font-family:'Share Tech Mono',monospace;width:46px;text-align:right;}
+.w3d-coins{font-family:'Share Tech Mono',monospace;font-size:.78rem;color:var(--gold2);margin-top:2px;}
+#w3d-zone{background:rgba(4,8,15,.9);border:1px solid rgba(201,168,76,.3);
+  padding:.3rem 1rem;font-family:'Share Tech Mono',monospace;font-size:.65rem;
+  color:var(--gold);letter-spacing:3px;text-transform:uppercase;}
+#w3d-enc{font-family:'Share Tech Mono',monospace;font-size:.62rem;color:var(--muted);
+  text-align:right;}
+/* Dialogue */
+#w3d-dlg{position:absolute;bottom:2rem;left:50%;transform:translateX(-50%);
+  z-index:30;width:min(620px,90vw);
+  background:rgba(4,8,15,.97);border:1px solid rgba(201,168,76,.45);
+  padding:1rem 1.2rem;display:none;
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 12px),calc(100% - 12px) 100%,0 100%);}
+.w3d-speaker{font-family:'Cinzel Decorative',serif;font-size:.78rem;
+  color:var(--gold2);letter-spacing:2px;margin-bottom:.4rem;}
+.w3d-text{font-size:1rem;color:var(--text);line-height:1.6;
+  font-family:'Rajdhani',sans-serif;font-weight:500;min-height:1.6rem;}
+.w3d-cont{font-size:.62rem;color:var(--muted);font-family:'Share Tech Mono',monospace;
+  letter-spacing:2px;margin-top:.5rem;text-align:right;animation:blinkC 1s infinite;}
+@keyframes blinkC{0%,100%{opacity:.3}50%{opacity:1}}
+/* Controls hint */
+#w3d-ctrl{position:absolute;bottom:1rem;left:50%;transform:translateX(-50%);z-index:10;
+  display:flex;gap:.5rem;align-items:center;
+  background:rgba(0,0,0,.8);border:1px solid rgba(201,168,76,.25);
+  padding:.35rem .85rem;}
+.wkey{width:28px;height:28px;background:rgba(201,168,76,.12);
+  border:2px solid rgba(201,168,76,.4);border-bottom-width:4px;border-radius:4px;
+  display:flex;align-items:center;justify-content:center;
+  font-family:'Cinzel Decorative',serif;font-size:.72rem;color:var(--gold2);}
+.wtxt{font-size:.62rem;color:var(--muted);font-family:'Share Tech Mono',monospace;letter-spacing:1px;}
+.wdiv{width:1px;height:20px;background:rgba(255,255,255,.1);}
+/* Combat UI */
+#w3d-combat{position:absolute;inset:0;z-index:20;pointer-events:none;display:none;}
+#w3d-mhud{position:absolute;top:1.2rem;left:50%;transform:translateX(-50%);
+  background:rgba(4,8,15,.92);border:1px solid rgba(255,46,46,.35);
+  padding:.5rem 1.2rem;min-width:280px;text-align:center;pointer-events:none;}
+#w3d-mname{font-family:'Cinzel Decorative',serif;font-size:.85rem;color:var(--red);letter-spacing:2px;}
+#w3d-mtype{font-size:.58rem;color:var(--muted);font-family:'Share Tech Mono',monospace;letter-spacing:3px;margin:.1rem 0;}
+#w3d-mhp-track{height:8px;background:rgba(255,255,255,.08);border-radius:2px;margin-top:.35rem;overflow:hidden;}
+#w3d-mhp-fill{height:100%;background:linear-gradient(90deg,#881111,var(--red));border-radius:2px;transition:width .5s;}
+#w3d-action{position:absolute;bottom:6rem;left:50%;transform:translateX(-50%);
+  text-align:center;pointer-events:all;}
+.w3d-dodge{font-family:'Cinzel Decorative',serif;font-size:1.4rem;
+  color:var(--cyan);text-shadow:0 0 20px var(--cyan);
+  animation:apPulse .6s ease-in-out infinite alternate;}
+.w3d-strike{font-family:'Cinzel Decorative',serif;font-size:1.4rem;
+  color:var(--gold2);text-shadow:0 0 20px var(--gold2);
+  animation:apPulse .4s ease-in-out infinite alternate;}
+@keyframes apPulse{from{opacity:.5;transform:scale(.97)}to{opacity:1;transform:scale(1.03)}}
+#w3d-flash{position:absolute;inset:0;pointer-events:none;opacity:0;transition:opacity .15s;}
+#w3d-flash.dok{background:radial-gradient(ellipse at 50%,rgba(0,255,255,.12),transparent 60%);}
+#w3d-flash.sok{background:radial-gradient(ellipse at 50%,rgba(255,215,0,.18),transparent 60%);}
+#w3d-flash.hit{background:radial-gradient(ellipse at 50%,rgba(255,0,0,.22),transparent 60%);}
+#w3d-flash.show{opacity:1;}
+/* Popup */
+#w3d-popup{position:absolute;inset:0;z-index:40;background:rgba(0,0,0,.88);
+  display:none;align-items:center;justify-content:center;padding:1rem;}
+/* Victory overlay */
+#w3d-vic{position:absolute;inset:0;z-index:45;background:rgba(0,0,0,.95);
+  display:none;align-items:center;justify-content:center;padding:1rem;}
+
+/* ═══════════════════════════════════════
+   LEADERBOARD SCREEN  (Realm 04)
+═══════════════════════════════════════ */
+#leaderboard{
+  background:radial-gradient(ellipse at 50% -10%,#0f0a1f 0%,#04080F 60%);
+  overflow-y:auto;align-items:center;height:100%;
+}
+.lb-wrap{position:relative;z-index:1;width:100%;max-width:820px;
+  padding:1rem;display:flex;flex-direction:column;gap:.9rem;}
+.lb-header{text-align:center;padding:.5rem 0;}
+.lb-title{font-family:'Cinzel Decorative',serif;font-size:1.1rem;
+  color:var(--gold2);letter-spacing:3px;}
+.lb-sub{font-size:.65rem;color:var(--muted);letter-spacing:2px;margin-top:.25rem;}
+.lb-guardian-badge{
+  display:inline-block;margin-top:.5rem;
+  background:rgba(155,48,255,.1);border:1px solid rgba(155,48,255,.3);
+  padding:.3rem .9rem;font-family:'Share Tech Mono',monospace;
+  font-size:.78rem;color:var(--purple);letter-spacing:1px;}
+/* Tabs */
+.lb-tabs{display:flex;gap:.5rem;}
+.lb-tab{flex:1;padding:.5rem;text-align:center;
+  font-family:'Share Tech Mono',monospace;font-size:.72rem;letter-spacing:2px;
+  border:1px solid rgba(255,255,255,.1);cursor:pointer;transition:all .2s;
+  background:rgba(0,0,0,.4);color:var(--muted);}
+.lb-tab.active{
+  background:rgba(155,48,255,.15);border-color:var(--purple);color:var(--purple);}
+.lb-tab:hover:not(.active){border-color:rgba(155,48,255,.3);color:var(--text);}
+/* Panel */
+.lb-panel{background:rgba(4,8,15,.95);border:1px solid rgba(155,48,255,.18);
+  min-height:280px;}
+.lb-panel-inner{padding:.15rem 0;}
+/* Score formula note */
+.lb-formula{font-family:'Share Tech Mono',monospace;font-size:.6rem;
+  color:var(--muted);text-align:center;padding:.4rem;
+  border-top:1px solid rgba(255,255,255,.05);}
+/* ra-4 accent */
+.ra-4{background:linear-gradient(180deg,var(--purple),#4400aa);}
+/* rt-lb tag */
+.rt-lb{background:rgba(155,48,255,.15);color:var(--purple);border:1px solid rgba(155,48,255,.3);}
+/* Refresh button */
+.lb-refresh{background:transparent;border:1px solid rgba(155,48,255,.3);
+  color:var(--purple);padding:.4rem 1rem;font-family:'Share Tech Mono',monospace;
+  font-size:.68rem;letter-spacing:2px;cursor:pointer;transition:all .2s;}
+.lb-refresh:hover{background:rgba(155,48,255,.15);border-color:var(--purple);}
+</style>
+</head>
+<body>
+
+<!-- ══════ TRANSITION OVERLAY ══════ -->
+<div id="transOverlay" style="position:fixed;inset:0;background:#000;z-index:200;opacity:0;pointer-events:none;transition:opacity .45s ease;"></div>
+
+<!-- ══════════════════════════════════
+     INTRO SCREEN
+══════════════════════════════════ -->
+<div id="intro" class="screen active">
+  <div class="temple-silhouette"></div>
+  <div class="ground-glow"></div>
+  <!-- Floating runes -->
+  <div class="frune" style="left:8%;top:22%;animation-delay:0s;animation-duration:12s">ᚠ</div>
+  <div class="frune" style="left:28%;top:58%;animation-delay:3s;animation-duration:9s">ᚢ</div>
+  <div class="frune" style="left:68%;top:32%;animation-delay:5s;animation-duration:11s">ᚦ</div>
+  <div class="frune" style="left:82%;top:65%;animation-delay:1.5s;animation-duration:8s">ᚷ</div>
+  <div class="frune" style="left:50%;top:15%;animation-delay:4s;animation-duration:10s">ᚱ</div>
+
+  <div class="intro-body">
+    <div class="emblem">
+      <svg viewBox="0 0 110 110">
+        <polygon points="55,4 92,20 108,55 108,55 92,90 55,106 18,90 2,55 2,55 18,20"
+          fill="none" stroke="rgba(201,168,76,.55)" stroke-width="2"/>
+        <polygon points="55,14 86,27 102,55 86,83 55,96 24,83 8,55 24,27"
+          fill="none" stroke="rgba(0,255,255,.2)" stroke-width="1"/>
+      </svg>
+      <div class="emblem-core">🛡️</div>
+    </div>
+    <div class="game-label">SETS GAMEATHON 2026 · CYBERSECURITY RPG</div>
+    <div class="game-title">CYBER<br>QUEST</div>
+    <div class="game-quote">"In the labyrinth of deception, knowledge is your weapon."</div>
+    <button class="btn-enter-temple" onclick="enterTemple()">⚔ ENTER THE TEMPLE</button>
+    <div class="team-label">TEAM INTERNET RANGERS · AIMSCS HYDERABAD</div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════
+     HUB SCREEN
+══════════════════════════════════ -->
+<div id="hub" class="screen">
+  <div class="hub-grid"></div>
+  <div class="hub-inner">
+
+    <!-- HUD -->
+    <div class="hud">
+      <div class="hud-av">
+        <svg width="36" height="36" viewBox="0 0 36 36">
+          <rect x="12" y="19" width="12" height="13" fill="#4a3520" rx="1"/>
+          <rect x="12" y="19" width="12" height="6" fill="#8a7040" rx="1"/>
+          <line x1="18" y1="20" x2="18" y2="24" stroke="rgba(0,255,255,.9)" stroke-width="1.3"/>
+          <line x1="14" y1="22" x2="22" y2="22" stroke="rgba(0,255,255,.9)" stroke-width="1.3"/>
+          <ellipse cx="18" cy="13" rx="7" ry="8" fill="#c0956a"/>
+          <path d="M11 11 L14 13 L11 15" fill="none" stroke="rgba(0,255,255,.9)" stroke-width="1.5"/>
+          <circle cx="15" cy="12" r="1.5" fill="#1a1a2a"/><circle cx="21" cy="12" r="1.5" fill="#1a1a2a"/>
+          <circle cx="15" cy="12" r=".8" fill="rgba(0,255,255,.75)"/><circle cx="21" cy="12" r=".8" fill="rgba(0,255,255,.75)"/>
+          <path d="M11 17 Q18 21 25 17" fill="#2a1a0a"/>
+          <rect x="4" y="19" width="8" height="3" fill="#8a7040" rx="1"/>
+          <rect x="24" y="19" width="8" height="3" fill="#8a7040" rx="1"/>
+          <circle cx="4" cy="21" r="2" fill="none" stroke="rgba(255,100,0,.7)" stroke-width="1"/>
+          <circle cx="32" cy="21" r="2" fill="none" stroke="rgba(255,100,0,.7)" stroke-width="1"/>
+        </svg>
+      </div>
+      <div class="hud-info">
+        <div class="hud-name">CYBER DEFENDER</div>
+        <div class="hud-role">⚔ Guardian of the Temple</div>
+      </div>
+      <div class="stat-block">
+        <div class="srow"><div class="si">❤️</div><div class="btrack"><div class="bfill hp" id="hpBar" style="width:100%"></div></div><div class="bval" id="hpVal">100/100</div></div>
+        <div class="srow"><div class="si">⭐</div><div class="btrack"><div class="bfill xp" id="xpBar" style="width:0%"></div></div><div class="bval" id="xpVal">0/300</div></div>
+      </div>
+      <div class="coin-badge"><span>🪙</span><span id="coinVal">300</span></div>
+    </div>
+
+    <div>
+      <div class="section-title">⚔ THE THREE REALMS ⚔</div>
+      <div class="section-sub">Choose your destination, Guardian</div>
+    </div>
+
+    <div class="realm-list">
+      <div class="rcard" onclick="startLabyrinth()">
+        <div class="rcard-accent ra-1"></div>
+        <div class="rcard-icon">🌀</div>
+        <div class="rcard-body">
+          <div class="rcard-num">REALM 01</div>
+          <div class="rcard-name">Labyrinth of the Lost</div>
+          <div class="rcard-desc">Navigate shifting corridors. Battle Goblin Thieves, Mirror Mimics, and face the Accursed Mammoth — the near-unbeatable brute force boss.</div>
+          <div class="rcard-tags">
+            <span class="rtag rt-go">▶ PLAYABLE</span>
+            <span class="rtag rt-xp">+300 XP</span>
+            <span class="rtag rt-hard">BOSS LEVEL</span>
+          </div>
+        </div>
+        <div class="rcard-arrow"><div class="arr">▶</div></div>
+      </div>
+      <div class="rcard" onclick="showScreen('tavern');initTavern()">
+        <div class="rcard-accent ra-2"></div>
+        <div class="rcard-icon">🍺</div>
+        <div class="rcard-body">
+          <div class="rcard-num">REALM 02</div>
+          <div class="rcard-name">Tavern of Unnamed Heroes</div>
+          <div class="rcard-desc">Speak with Greymantle the AI bartender. Buy intel, read the quest noticeboard, learn monster weaknesses.</div>
+          <div class="rcard-tags">
+            <span class="rtag rt-ai">⚡ AI BARTENDER</span>
+            <span class="rtag rt-xp">+50 XP/VISIT</span>
+          </div>
+        </div>
+        <div class="rcard-arrow"><div class="arr">▶</div></div>
+      </div>
+      <div class="rcard" onclick="showScreen('guild')">
+        <div class="rcard-accent ra-3"></div>
+        <div class="rcard-icon">⚔️</div>
+        <div class="rcard-body">
+          <div class="rcard-num">REALM 03</div>
+          <div class="rcard-name">Guild of Remembered Guardians</div>
+          <div class="rcard-desc">Buy skill potions, unlock new powers, and take on guild quests from veteran cyber-defenders.</div>
+          <div class="rcard-tags">
+            <span class="rtag rt-ai">SKILL SHOP</span>
+            <span class="rtag rt-ai">QUESTS</span>
+          </div>
+        </div>
+        <div class="rcard-arrow"><div class="arr">▶</div></div>
+      </div>
+      <div class="rcard" onclick="showLeaderboard()">
+        <div class="rcard-accent ra-4"></div>
+        <div class="rcard-icon">🏆</div>
+        <div class="rcard-body">
+          <div class="rcard-num">REALM 04</div>
+          <div class="rcard-name">Hall of Fallen Guardians</div>
+          <div class="rcard-desc">See how your score ranks among all Guardians. Zero personal data — you are known only by your Guardian ID.</div>
+          <div class="rcard-tags">
+            <span class="rtag rt-lb">🏆 LEADERBOARD</span>
+            <span class="rtag rt-lb">📊 ANALYTICS</span>
+            <span class="rtag rt-go">🔒 PRIVATE</span>
+          </div>
+        </div>
+        <div class="rcard-arrow"><div class="arr">▶</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<!-- ══════════════════════════════════
+     LEADERBOARD SCREEN — REALM 04
+══════════════════════════════════ -->
+<div id="leaderboard" class="screen">
+  <div class="lb-wrap">
+
+    <!-- Back -->
+    <button onclick="showScreen('hub')" style="align-self:flex-start;background:transparent;
+      border:1px solid rgba(201,168,76,.28);color:var(--gold);padding:.38rem .85rem;
+      font-family:'Rajdhani',sans-serif;font-size:.78rem;font-weight:700;
+      cursor:pointer;letter-spacing:2px">◀ RETURN TO MAP</button>
+
+    <!-- Header -->
+    <div class="lb-header">
+      <div class="lb-title">⚔ HALL OF FALLEN GUARDIANS ⚔</div>
+      <div class="lb-sub">REALM 04 · ANONYMOUS LEADERBOARD · PRIVACY-BY-DESIGN</div>
+      <div class="lb-guardian-badge" id="lb-my-id">Identifying Guardian…</div>
+    </div>
+
+    <!-- Score formula -->
+    <div style="background:rgba(155,48,255,.06);border:1px solid rgba(155,48,255,.15);
+      padding:.55rem .8rem;font-family:'Share Tech Mono',monospace;font-size:.65rem;
+      color:var(--muted);line-height:1.8;">
+      <span style="color:var(--purple)">SCORE FORMULA</span> &nbsp;·&nbsp;
+      XP earned &nbsp;+&nbsp; (Accuracy% × 2) &nbsp;+&nbsp; HP remaining
+      &nbsp;=&nbsp; <span style="color:var(--gold2)">Final Score</span>
+    </div>
+
+    <!-- Tabs -->
+    <div class="lb-tabs">
+      <div class="lb-tab active" id="tab-lb"    onclick="lbSwitchTab('lb')">🏆 LEADERBOARD</div>
+      <div class="lb-tab"        id="tab-stats" onclick="lbSwitchTab('stats')">📊 ANALYTICS</div>
+    </div>
+
+    <!-- Leaderboard panel -->
+    <div class="lb-panel" id="panel-lb">
+      <div class="lb-panel-inner" id="lb-rows">
+        <div style="color:var(--muted);text-align:center;padding:2rem;
+          font-size:.8rem;font-family:'Share Tech Mono',monospace">Loading leaderboard…</div>
+      </div>
+      <div class="lb-formula">Score = XP + (Accuracy × 2) + HP · Top 10 shown · Updates after each run</div>
+    </div>
+
+    <!-- Analytics panel (hidden by default) -->
+    <div class="lb-panel" id="panel-stats" style="display:none">
+      <div style="padding:.7rem" id="lb-analytics">
+        <div style="color:var(--muted);text-align:center;padding:2rem;
+          font-size:.8rem;font-family:'Share Tech Mono',monospace">Loading analytics…</div>
+      </div>
+    </div>
+
+    <!-- Refresh -->
+    <div style="display:flex;justify-content:center">
+      <button class="lb-refresh" onclick="lbRefresh()">↺ REFRESH DATA</button>
+    </div>
+
+    <!-- Privacy notice -->
+    <div style="background:rgba(0,255,136,.04);border:1px solid rgba(0,255,136,.12);
+      padding:.65rem .85rem;font-size:.68rem;color:var(--muted);line-height:1.7;">
+      🔒 <span style="color:var(--green)">Privacy architecture</span> —
+      Your anonymous UID never appears in any public document. Only your self-chosen
+      Guardian ID (a pseudonym) is visible to others. Developers cannot link any score
+      to a real person. No emails, names, or device fingerprints are collected.
+      This is cybersecurity practiced, not just preached.
+    </div>
+
+  </div>
+</div>
+
+<!-- ══════════════════════════════════
+══════════════════════════════════ -->
+<div id="labyrinth" class="screen">
+  <div id="fpScene">
+
+    <!-- ── OPENING CINEMATIC ── -->
+    <div id="labOpening">
+
+      <!-- Stone gate panels -->
+      <div class="gate-l" id="gateL">
+        <div class="gate-face">
+          <div class="gate-emblem">🛡️</div>
+          <div class="gate-runes-col">
+            <div class="grune">ᚠ</div><div class="grune">ᚢ</div>
+            <div class="grune">ᚦ</div><div class="grune">ᚷ</div>
+          </div>
+          <div class="gate-vbar"></div>
+        </div>
+      </div>
+      <div class="gate-r" id="gateR">
+        <div class="gate-face">
+          <div class="gate-emblem">⚔️</div>
+          <div class="gate-runes-col">
+            <div class="grune">ᚲ</div><div class="grune">ᚺ</div>
+            <div class="grune">ᚾ</div><div class="grune">ᛁ</div>
+          </div>
+          <div class="gate-vbar"></div>
+        </div>
+      </div>
+
+      <!-- Atmosphere -->
+      <div class="open-fog" id="openFog"></div>
+      <div class="open-vig" id="openVig"></div>
+      <div class="open-scan" id="openScan"></div>
+
+      <!-- Text content -->
+      <div class="open-layer">
+        <div class="o-location" id="oLoc">REALM 01 · LABYRINTH OF THE LOST</div>
+        <div class="o-divider" id="oDivTop"></div>
+        <div class="o-title" id="oTitle"></div>
+        <div class="o-narr" id="oN1"></div>
+        <div class="o-narr" id="oN2"></div>
+        <div class="o-narr" id="oN3"></div>
+        <div class="o-divider" id="oDivBot"></div>
+        <div class="o-sub" id="oSub"></div>
+        <div class="o-enter" id="oEnter">ENTER</div>
+      </div>
+
+      <button id="skipBtn" onclick="skipOpening()">SKIP ▶▶</button>
+    </div>
+    <!-- ── END OPENING ── -->
+
+    <!-- First-person corridor -->
+    <div id="fpCeil">
+      <div class="ceil-lines"></div>
+      <div class="wall-l"><div class="rune-strip rs-l"></div></div>
+      <div class="wall-r"><div class="rune-strip rs-r"></div></div>
+      <div class="depth-pulse" id="depthPulse"></div>
+      <div class="vp-dot"></div>
+    </div>
+    <div id="fpFloor"><div class="floor-grid"></div></div>
+
+    <!-- Muscular arms with tech-medieval gauntlets -->
+    <div id="fpBody">
+      <svg viewBox="0 0 900 220" preserveAspectRatio="xMidYMax meet" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="skinL" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#7a4e2a"/><stop offset="45%" stop-color="#b86830"/><stop offset="100%" stop-color="#6a3e22"/>
+          </linearGradient>
+          <linearGradient id="skinR" x1="100%" y1="0%" x2="0%" y2="0%">
+            <stop offset="0%" stop-color="#7a4e2a"/><stop offset="45%" stop-color="#b86830"/><stop offset="100%" stop-color="#6a3e22"/>
+          </linearGradient>
+          <linearGradient id="metal" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#221830"/><stop offset="55%" stop-color="#14101e"/><stop offset="100%" stop-color="#0c0a14"/>
+          </linearGradient>
+          <linearGradient id="goldG" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#7a5018"/><stop offset="50%" stop-color="#C9A84C"/><stop offset="100%" stop-color="#7a5018"/>
+          </linearGradient>
+          <radialGradient id="cyanCrystal" cx="50%" cy="30%" r="70%">
+            <stop offset="0%" stop-color="#ccffff" stop-opacity=".9"/>
+            <stop offset="60%" stop-color="#00ffff" stop-opacity=".65"/>
+            <stop offset="100%" stop-color="#003348" stop-opacity=".3"/>
+          </radialGradient>
+          <radialGradient id="orbFire" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#ffaa33"/><stop offset="60%" stop-color="#ff5500" stop-opacity=".8"/>
+            <stop offset="100%" stop-color="#cc1100" stop-opacity=".3"/>
+          </radialGradient>
+          <filter id="glow4"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+          <filter id="glow8"><feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+        </defs>
+
+        <!-- ── LEFT ARM ── -->
+        <!-- Bicep — thick muscle mass -->
+        <path d="M28,38 Q6,54 5,92 Q8,132 34,146 Q64,150 80,132 Q96,110 88,74 Q80,42 58,32 Z" fill="url(#skinL)"/>
+        <!-- Bicep peak highlight -->
+        <path d="M34,52 Q18,75 20,108 Q24,128 38,136" fill="none" stroke="rgba(200,135,70,.4)" stroke-width="2"/>
+        <!-- Deltoid crease -->
+        <path d="M58,32 Q72,38 80,50" fill="none" stroke="rgba(170,100,50,.35)" stroke-width="1.5"/>
+        <!-- Shoulder armour plate -->
+        <path d="M22,36 Q50,16 82,33 Q93,47 88,64 Q70,50 50,47 Q28,50 20,65 Z" fill="url(#metal)" stroke="url(#goldG)" stroke-width="1.6"/>
+        <circle cx="32" cy="46" r="2.8" fill="var(--gold)" filter="url(#glow4)"/>
+        <circle cx="55" cy="40" r="2.8" fill="var(--gold)" filter="url(#glow4)"/>
+        <circle cx="75" cy="45" r="2.8" fill="var(--gold)" filter="url(#glow4)"/>
+        <text x="41" y="56" fill="rgba(0,255,255,.65)" font-size="11" font-family="serif" style="animation:runeGlow 2.2s infinite">ᚠ</text>
+        <!-- Forearm — visible muscle striations -->
+        <path d="M34,144 Q12,162 11,198 Q15,218 44,220 Q72,220 84,202 Q93,180 82,152 Q65,140 50,140 Z" fill="url(#skinL)"/>
+        <path d="M28,160 Q18,178 20,200" fill="none" stroke="rgba(140,82,35,.45)" stroke-width="1.5"/>
+        <path d="M46,147 Q40,172 42,202" fill="none" stroke="rgba(140,82,35,.35)" stroke-width="1"/>
+        <path d="M60,148 Q58,172 56,202" fill="none" stroke="rgba(140,82,35,.3)" stroke-width="1"/>
+        <!-- Bracer -->
+        <rect x="12" y="156" width="72" height="13" rx="3" fill="url(#metal)" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <rect x="17" y="159" width="56" height="4" rx="1" fill="rgba(0,255,255,.08)"/>
+        <rect x="17" y="159" width="30" height="4" rx="1" fill="rgba(0,255,255,.32)" style="animation:runeGlow 3s infinite"/>
+        <circle cx="78" cy="162" r="2.2" fill="rgba(0,255,255,.6)" filter="url(#glow4)"/>
+        <circle cx="72" cy="162" r="2.2" fill="var(--gold)" filter="url(#glow4)"/>
+        <!-- GAUNTLET -->
+        <path d="M10,197 Q8,218 14,228 Q44,236 84,225 Q90,215 87,197 Q70,186 50,184 Q26,185 10,197 Z" fill="url(#metal)" stroke="rgba(201,168,76,.48)" stroke-width="1.6"/>
+        <!-- Finger plates -->
+        <rect x="16" y="224" width="13" height="19" rx="3" fill="#14101e" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <rect x="32" y="222" width="13" height="21" rx="3" fill="#14101e" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <rect x="48" y="221" width="13" height="22" rx="3" fill="#14101e" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <rect x="64" y="222" width="12" height="21" rx="3" fill="#14101e" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <!-- Knuckle runes -->
+        <text x="17" y="234" fill="rgba(0,255,255,.72)" font-size="7.5" font-family="serif">ᚠ</text>
+        <text x="33" y="234" fill="rgba(0,255,255,.72)" font-size="7.5" font-family="serif">ᚢ</text>
+        <text x="49" y="234" fill="rgba(0,255,255,.72)" font-size="7.5" font-family="serif">ᚦ</text>
+        <text x="65" y="234" fill="rgba(0,255,255,.72)" font-size="7.5" font-family="serif">ᚷ</text>
+        <!-- Wrist tech band -->
+        <rect x="9" y="194" width="78" height="8" rx="2" fill="#0a0814" stroke="rgba(0,255,255,.48)" stroke-width="1"/>
+        <rect x="14" y="196" width="32" height="4" rx="1" fill="rgba(0,255,255,.12)"/>
+        <rect x="14" y="196" width="19" height="4" rx="1" fill="rgba(0,255,255,.38)" style="animation:runeGlow 2s infinite"/>
+        <rect x="52" y="196" width="28" height="4" rx="1" fill="rgba(201,168,76,.08)"/>
+        <rect x="52" y="196" width="16" height="4" rx="1" fill="rgba(201,168,76,.32)"/>
+        <!-- Gauntlet back rune -->
+        <text x="28" y="212" fill="rgba(0,255,255,.48)" font-size="14" font-family="serif" style="animation:runeGlow 2.8s infinite .5s">ᚲ</text>
+        <!-- Chain blade orb -->
+        <circle cx="54" cy="210" r="11" fill="url(#metal)" stroke="url(#goldG)" stroke-width="2"/>
+        <circle cx="54" cy="210" r="6.5" fill="url(#orbFire)" filter="url(#glow8)" style="animation:orbPulse 2.2s ease-in-out infinite"/>
+        <path d="M43,210 Q32,205 22,214" fill="none" stroke="rgba(255,100,0,.6)" stroke-width="2" stroke-dasharray="4,3" style="animation:chainAnim 2s infinite"/>
+        <path d="M54,199 Q56,187 50,178" fill="none" stroke="rgba(255,100,0,.5)" stroke-width="1.5" stroke-dasharray="3,2" style="animation:chainAnim 2s infinite .5s"/>
+        <!-- Side spikes -->
+        <polygon points="8,202 1,198 4,207" fill="var(--gold)" opacity=".65"/>
+        <polygon points="8,214 1,212 4,220" fill="var(--gold)" opacity=".45"/>
+        <!-- Crystal slot -->
+        <polygon points="70,198 77,193 83,198 83,206 77,211 70,206" fill="url(#cyanCrystal)" stroke="rgba(0,255,255,.8)" stroke-width="1" filter="url(#glow4)"/>
+
+        <!-- ── RIGHT ARM ── -->
+        <path d="M872,38 Q894,54 895,92 Q892,132 866,146 Q836,150 820,132 Q804,110 812,74 Q820,42 842,32 Z" fill="url(#skinR)"/>
+        <path d="M866,52 Q882,75 880,108 Q876,128 862,136" fill="none" stroke="rgba(200,135,70,.4)" stroke-width="2"/>
+        <path d="M842,32 Q828,38 820,50" fill="none" stroke="rgba(170,100,50,.35)" stroke-width="1.5"/>
+        <path d="M878,36 Q850,16 818,33 Q807,47 812,64 Q830,50 850,47 Q872,50 880,65 Z" fill="url(#metal)" stroke="url(#goldG)" stroke-width="1.6"/>
+        <circle cx="868" cy="46" r="2.8" fill="var(--gold)" filter="url(#glow4)"/>
+        <circle cx="845" cy="40" r="2.8" fill="var(--gold)" filter="url(#glow4)"/>
+        <circle cx="825" cy="45" r="2.8" fill="var(--gold)" filter="url(#glow4)"/>
+        <text x="846" y="56" fill="rgba(0,255,255,.65)" font-size="11" font-family="serif" style="animation:runeGlow 2.2s infinite .3s">ᚱ</text>
+        <!-- Forearm R -->
+        <path d="M866,144 Q888,162 889,198 Q885,218 856,220 Q828,220 816,202 Q807,180 818,152 Q835,140 850,140 Z" fill="url(#skinR)"/>
+        <path d="M872,160 Q882,178 880,200" fill="none" stroke="rgba(140,82,35,.45)" stroke-width="1.5"/>
+        <path d="M854,147 Q860,172 858,202" fill="none" stroke="rgba(140,82,35,.35)" stroke-width="1"/>
+        <path d="M840,148 Q842,172 844,202" fill="none" stroke="rgba(140,82,35,.3)" stroke-width="1"/>
+        <!-- Bracer R -->
+        <rect x="816" y="156" width="72" height="13" rx="3" fill="url(#metal)" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <rect x="827" y="159" width="56" height="4" rx="1" fill="rgba(0,255,255,.08)"/>
+        <rect x="853" y="159" width="26" height="4" rx="1" fill="rgba(0,255,255,.32)" style="animation:runeGlow 3s infinite .7s"/>
+        <circle cx="820" cy="162" r="2.2" fill="rgba(0,255,255,.6)" filter="url(#glow4)"/>
+        <circle cx="826" cy="162" r="2.2" fill="var(--gold)" filter="url(#glow4)"/>
+        <!-- Gauntlet R -->
+        <path d="M890,197 Q892,218 886,228 Q856,236 816,225 Q810,215 813,197 Q830,186 850,184 Q874,185 890,197 Z" fill="url(#metal)" stroke="rgba(201,168,76,.48)" stroke-width="1.6"/>
+        <rect x="871" y="224" width="13" height="19" rx="3" fill="#14101e" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <rect x="855" y="222" width="13" height="21" rx="3" fill="#14101e" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <rect x="839" y="221" width="13" height="22" rx="3" fill="#14101e" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <rect x="824" y="222" width="12" height="21" rx="3" fill="#14101e" stroke="rgba(201,168,76,.38)" stroke-width="1"/>
+        <text x="872" y="234" fill="rgba(0,255,255,.72)" font-size="7.5" font-family="serif">ᚠ</text>
+        <text x="856" y="234" fill="rgba(0,255,255,.72)" font-size="7.5" font-family="serif">ᚢ</text>
+        <text x="840" y="234" fill="rgba(0,255,255,.72)" font-size="7.5" font-family="serif">ᚦ</text>
+        <text x="825" y="234" fill="rgba(0,255,255,.72)" font-size="7.5" font-family="serif">ᚷ</text>
+        <rect x="813" y="194" width="78" height="8" rx="2" fill="#0a0814" stroke="rgba(0,255,255,.48)" stroke-width="1"/>
+        <rect x="854" y="196" width="32" height="4" rx="1" fill="rgba(0,255,255,.12)"/>
+        <rect x="867" y="196" width="15" height="4" rx="1" fill="rgba(0,255,255,.38)" style="animation:runeGlow 2s infinite .35s"/>
+        <rect x="820" y="196" width="28" height="4" rx="1" fill="rgba(201,168,76,.08)"/>
+        <rect x="820" y="196" width="16" height="4" rx="1" fill="rgba(201,168,76,.32)"/>
+        <text x="848" y="212" fill="rgba(0,255,255,.48)" font-size="14" font-family="serif" style="animation:runeGlow 2.8s infinite 1s">ᚲ</text>
+        <circle cx="846" cy="210" r="11" fill="url(#metal)" stroke="url(#goldG)" stroke-width="2"/>
+        <circle cx="846" cy="210" r="6.5" fill="url(#orbFire)" filter="url(#glow8)" style="animation:orbPulse 2.2s ease-in-out infinite .45s"/>
+        <path d="M857,210 Q868,205 878,214" fill="none" stroke="rgba(255,100,0,.6)" stroke-width="2" stroke-dasharray="4,3" style="animation:chainAnim 2s infinite .3s"/>
+        <path d="M846,199 Q844,187 850,178" fill="none" stroke="rgba(255,100,0,.5)" stroke-width="1.5" stroke-dasharray="3,2" style="animation:chainAnim 2s infinite .8s"/>
+        <polygon points="892,202 899,198 896,207" fill="var(--gold)" opacity=".65"/>
+        <polygon points="892,214 899,212 896,220" fill="var(--gold)" opacity=".45"/>
+        <polygon points="830,198 823,193 817,198 817,206 823,211 830,206" fill="url(#cyanCrystal)" stroke="rgba(0,255,255,.8)" stroke-width="1" filter="url(#glow4)"/>
+
+        <!-- Chest / torso visible between arms -->
+        <path d="M315,42 Q450,34 585,42 L582,94 Q450,102 318,94 Z" fill="url(#metal)" stroke="rgba(201,168,76,.28)" stroke-width="1"/>
+        <line x1="450" y1="47" x2="450" y2="90" stroke="rgba(0,255,255,.6)" stroke-width="2" style="animation:runeGlow 3s infinite"/>
+        <line x1="412" y1="68" x2="488" y2="68" stroke="rgba(0,255,255,.55)" stroke-width="2" style="animation:runeGlow 3s infinite .5s"/>
+        <circle cx="450" cy="68" r="9" fill="url(#metal)" stroke="url(#goldG)" stroke-width="2"/>
+        <circle cx="450" cy="68" r="5" fill="url(#cyanCrystal)" filter="url(#glow8)" style="animation:orbPulse 3.2s infinite"/>
+        <rect x="316" y="90" width="268" height="13" rx="3" fill="#100c18" stroke="rgba(201,168,76,.45)" stroke-width="1"/>
+        <rect x="441" y="90" width="18" height="13" rx="2" fill="var(--gold)" opacity=".65"/>
+      </svg>
+    </div>
+
+    <!-- HUD -->
+    <div id="labHud">
+      <div class="hud-stats">
+        <div class="srow"><div class="si">❤️</div><div class="btrack"><div class="bfill hp" id="lhp" style="width:100%"></div></div><div class="bval" id="lhpv">100</div></div>
+        <div class="srow"><div class="si">🪙</div><div class="bval" id="lcoins" style="color:var(--gold2);width:auto">300</div></div>
+        <div class="srow"><div class="si">⭐</div><div class="bval" id="lxp" style="color:#ffd700;width:auto">0 XP</div></div>
+        <div class="srow"><div class="si">💀</div><div class="bval" id="lkills" style="color:var(--red);width:auto">0 slain</div></div>
+      </div>
+      <div class="minimap">
+        <div class="mm-grid"></div>
+        <div class="mm-player" id="mmDot" style="left:50%;top:82%"></div>
+      </div>
+    </div>
+
+    <!-- Trail -->
+    <div id="trailBar"></div>
+
+    <!-- Move prompt -->
+    <div id="movePrompt" style="display:none">
+      <div class="prompt-box">
+        <div class="prompt-key">W</div>
+        <div class="prompt-txt">/ CLICK / TAP TO ADVANCE</div>
+        <div class="prompt-key" style="font-size:.7rem">👆</div>
+      </div>
+    </div>
+
+    <!-- Encounter / consequence / victory -->
+    <div id="encModal"></div>
+    <div id="conOverlay"></div>
+    <div id="labVic"></div>
+
+    <button id="labBack" onclick="showScreen('hub')">◀ RETREAT</button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════
+     TAVERN
+══════════════════════════════════ -->
+<div id="tavern" class="screen">
+  <div class="tav-wrap">
+    <div class="torch tl"><div class="torch-g"></div><div class="torch-f">🔥</div></div>
+    <div class="torch tr"><div class="torch-g"></div><div class="torch-f">🔥</div></div>
+    <div class="noticeboard">
+      <div class="nb-ttl">📌 QUEST BOARD</div>
+      <div class="nb-item">⚠️ Goblin sightings in east corridor</div>
+      <div class="nb-item">💰 Bounty: Mimic pack +400 coins</div>
+      <div class="nb-item">🐘 Mammoth stirring — prepare well</div>
+    </div>
+    <div class="tav-hdr">
+      <button class="btn-back" onclick="showScreen('hub')">◀ LEAVE</button>
+      <div class="tav-ttl">🍺 Tavern of Unnamed Heroes</div>
+      <div class="coin-badge"><span>🪙</span><span id="tavCoins">300</span></div>
+    </div>
+    <div class="bart-scene">
+      <div class="bart-visual">
+        <div class="bar-top"></div>
+        <div class="bottles"><div class="bott">🍾</div><div class="bott">🫙</div><div class="bott">⚗️</div></div>
+        <div class="bart-char">
+          <svg width="78" height="122" viewBox="0 0 80 125">
+            <path d="M15,60 Q10,125 10,125 L70,125 Q70,125 65,60 Z" fill="#2a1a3a"/>
+            <path d="M30,65 Q28,118 28,125 L32,125 Q32,118 34,65 Z" fill="rgba(155,48,255,.18)"/>
+            <circle cx="40" cy="80" r="8" fill="none" stroke="rgba(155,48,255,.55)" stroke-width="1.5"/>
+            <text x="36" y="84" fill="rgba(155,48,255,.75)" font-size="8">ᚷ</text>
+            <path d="M18,35 Q15,20 40,15 Q65,20 62,35 Q60,60 65,60 Q55,65 40,65 Q25,65 15,60 Q20,60 18,35 Z" fill="#1a0a2a"/>
+            <ellipse cx="40" cy="45" rx="13" ry="14" fill="#2a1a0a"/>
+            <circle cx="35" cy="43" r="2.5" fill="#9B30FF"/><circle cx="45" cy="43" r="2.5" fill="#9B30FF"/>
+            <circle cx="35" cy="43" r="1.2" fill="white" opacity=".8"/><circle cx="45" cy="43" r="1.2" fill="white" opacity=".8"/>
+            <path d="M30,52 Q40,60 50,52 Q45,65 40,67 Q35,65 30,52Z" fill="#6a5a4a"/>
+            <rect x="5" y="60" width="14" height="8" fill="#2a1a3a" rx="3"/>
+            <rect x="61" y="60" width="14" height="8" fill="#2a1a3a" rx="3"/>
+            <rect x="18" y="55" width="19" height="21" fill="#8a6a40" rx="2"/>
+            <rect x="35" y="60" width="5" height="11" fill="#6a4a20" rx="1"/>
+            <rect x="18" y="55" width="19" height="4" fill="#aaa" rx="1" opacity=".5"/>
+          </svg>
+        </div>
+      </div>
+      <div class="chat-area">
+        <div class="chat-msgs" id="chatMsgs">
+          <div class="cmsg"><div class="cav b">🧙</div><div class="cbub b">*sets down mug* Another Guardian enters... The labyrinth grows hungry tonight. Goblin Thieves swarm the eastern passages, and the Accursed Mammoth stirs deep below. What do you seek?</div></div>
+          <div class="cmsg"><div class="cav b">🧙</div><div class="cbub b">Ask me about the monsters, buy intel for 50 coins, or inquire about guild quests. Knowledge is the sharpest blade.</div></div>
+        </div>
+        <div class="chat-in-row">
+          <input class="cinput" id="chatIn" placeholder="Speak with Greymantle..." onkeydown="if(event.key==='Enter')sendMsg()"/>
+          <button class="csend" onclick="sendMsg()">⚡ SEND</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════
+     GUILD
+══════════════════════════════════ -->
+<div id="guild" class="screen">
+  <div class="guild-wrap">
+    <div class="guild-hdr">
+      <div><div class="guild-ttl">Guild of Remembered Guardians</div>
+        <div style="font-size:.65rem;color:var(--muted);letter-spacing:2px;margin-top:.15rem">SKILL SHOP · QUESTS · TRAINING</div></div>
+      <span style="font-size:2.4rem">⚔️</span>
+    </div>
+    <button class="btn-back" onclick="showScreen('hub')" style="align-self:flex-start">◀ LEAVE GUILD</button>
+    <div>
+      <div class="g-sec-ttl">⚗️ Skill Potions & Upgrades</div>
+      <div class="shop-grid">
+        <div class="sitem" onclick="buy('Phishing Eye',100)"><div class="si-icon">👁️</div><div class="si-name">Phishing Eye</div><div class="si-desc">Detect suspicious email domains</div><div class="si-cost">🪙 100</div></div>
+        <div class="sitem" onclick="buy('Deepfake Shield',150)"><div class="si-icon">🛡️</div><div class="si-name">Deepfake Shield</div><div class="si-desc">+50% XP on AI content detection</div><div class="si-cost">🪙 150</div></div>
+        <div class="sitem" onclick="buy('Second Chance',200)"><div class="si-icon">⚗️</div><div class="si-name">Second Chance</div><div class="si-desc">One free retry before damage</div><div class="si-cost">🪙 200</div></div>
+        <div class="sitem" onclick="buy('Rune of Clarity',80)"><div class="si-icon">✨</div><div class="si-name">Rune of Clarity</div><div class="si-desc">Reveals one wrong answer</div><div class="si-cost">🪙 80</div></div>
+        <div class="sitem locked"><div class="si-icon">⚡</div><div class="si-name">Speedrun Amulet</div><div class="si-desc">Clear Realm 1 first</div><div class="si-cost" style="color:var(--muted)">🔒 LOCKED</div></div>
+        <div class="sitem locked"><div class="si-icon">🌐</div><div class="si-name">Network Map</div><div class="si-desc">Full minimap from start</div><div class="si-cost" style="color:var(--muted)">🔒 LOCKED</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="g-sec-ttl">📜 Active Guild Quests</div>
+      <div class="qlist">
+        <div class="qitem"><div class="qi-icon">🎯</div><div class="qi-info"><div class="qi-name">The Phishing Purge</div><div class="qi-desc">Clear Labyrinth without losing HP</div><div class="qi-reward">REWARD: 🪙 500 + ⭐ 100 XP</div></div><div class="qi-status qs-new">NEW</div></div>
+        <div class="qitem"><div class="qi-icon">🐘</div><div class="qi-info"><div class="qi-name">Slay the Mammoth</div><div class="qi-desc">Defeat the Accursed Mammoth boss</div><div class="qi-reward">REWARD: 🪙 300 + 🏆 Boss Badge</div></div><div class="qi-status qs-new">NEW</div></div>
+        <div class="qitem"><div class="qi-icon">🔍</div><div class="qi-info"><div class="qi-name">Mimic Hunter</div><div class="qi-desc">Identify all Mirror Mimics (Realm 2 soon)</div><div class="qi-reward">REWARD: 🪙 300 + 🛡️ Deepfake Shield</div></div><div class="qi-status qs-lk">LOCKED</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════
+     WORLD 3D — Three.js labyrinth
+══════════════════════════════════ -->
+<div id="world3d" class="screen">
+  <canvas id="w3dCanvas"></canvas>
+  <div id="w3d-hud">
+    <div class="w3d-block">
+      <div class="w3d-row">
+        <span style="font-size:.8rem;width:16px">❤️</span>
+        <div class="w3d-bar"><div class="w3d-fill wf-hp" id="w3d-hp" style="width:100%"></div></div>
+        <div class="w3d-val" id="w3d-hpv">100</div>
+      </div>
+      <div class="w3d-row">
+        <span style="font-size:.8rem;width:16px">⭐</span>
+        <div class="w3d-bar"><div class="w3d-fill wf-xp" id="w3d-xp" style="width:0%"></div></div>
+        <div class="w3d-val" id="w3d-xpv">0</div>
+      </div>
+      <div class="w3d-coins">🪙 <span id="w3d-cv">300</span></div>
+    </div>
+    <div id="w3d-zone">ALDRIC'S POST</div>
+    <div class="w3d-block" style="text-align:right;min-width:90px;">
+      <div style="font-family:'Share Tech Mono',monospace;font-size:.6rem;color:var(--muted)">ENCOUNTER</div>
+      <div style="font-family:'Cinzel Decorative',serif;font-size:.88rem;color:var(--gold2)" id="w3d-ec">— / 5</div>
+    </div>
+  </div>
+  <div id="w3d-dlg">
+    <div class="w3d-speaker" id="w3d-spk">ALDRIC</div>
+    <div class="w3d-text" id="w3d-txt"></div>
+    <div class="w3d-cont">[ PRESS ENTER OR CLICK TO CONTINUE ]</div>
+  </div>
+  <div id="w3d-ctrl" style="display:none">
+    <div class="wkey">W</div><div class="wtxt">MOVE</div>
+    <div class="wdiv"></div>
+    <div class="wkey">A</div><div class="wkey">D</div><div class="wtxt">DODGE</div>
+    <div class="wdiv"></div>
+    <div class="wkey" style="font-size:.55rem">SPC</div><div class="wtxt">STRIKE</div>
+  </div>
+  <div id="w3d-combat">
+    <div id="w3d-mhud">
+      <div id="w3d-mname">—</div>
+      <div id="w3d-mtype">—</div>
+      <div id="w3d-mhp-track"><div id="w3d-mhp-fill" style="width:100%"></div></div>
+    </div>
+    <div id="w3d-action"></div>
+    <div id="w3d-flash"></div>
+  </div>
+  <div id="w3d-popup" style="position:absolute;inset:0;z-index:40;background:rgba(0,0,0,.88);display:none;align-items:center;justify-content:center;padding:1rem">
+    <div style="width:min(520px,92vw);background:linear-gradient(180deg,#080f08,#040c04);border:1px solid rgba(0,255,136,.3);clip-path:polygon(0 0,100% 0,100% calc(100% - 16px),calc(100% - 16px) 100%,0 100%)">
+      <div style="padding:.75rem 1rem;background:rgba(0,255,136,.06);border-bottom:1px solid rgba(0,255,136,.12)">
+        <span id="w3d-ptrophy" style="font-size:3rem;display:block;text-align:center;margin:.5rem 0;animation:trophyPulse 1s infinite alternate">⚔</span>
+        <div id="w3d-ptitle" style="font-family:'Cinzel Decorative',serif;font-size:1.1rem;color:var(--green);text-align:center;letter-spacing:3px">THREAT DEFEATED</div>
+      </div>
+      <div style="padding:.85rem 1rem">
+        <div id="w3d-panalogy" style="background:rgba(0,255,136,.06);border-left:3px solid var(--green);padding:.6rem .8rem;font-size:.85rem;color:var(--text);line-height:1.65;margin-bottom:.65rem;font-style:italic"></div>
+        <div id="w3d-plesson" style="font-size:.8rem;color:var(--muted);line-height:1.6;margin-bottom:.75rem"></div>
+        <div id="w3d-prews" style="display:flex;gap:.45rem;flex-wrap:wrap;margin-bottom:.75rem"></div>
+      </div>
+      <button onclick="w3dClosePopup()" style="display:block;width:calc(100% - 2rem);margin:0 1rem 1rem;background:rgba(0,255,136,.1);border:2px solid var(--green);color:var(--green);padding:.6rem;font-family:'Cinzel Decorative',serif;font-size:.85rem;letter-spacing:2px;cursor:pointer;clip-path:polygon(8px 0%,100% 0%,calc(100% - 8px) 100%,0% 100%)" id="w3d-pbtn">⚔ CONTINUE</button>
+    </div>
+  </div>
+  <div id="w3d-vic" style="position:absolute;inset:0;z-index:45;background:rgba(0,0,0,.95);display:none;align-items:center;justify-content:center;padding:1rem">
+    <div style="text-align:center;max-width:460px">
+      <div style="font-family:'Cinzel Decorative',serif;font-size:clamp(1.5rem,5vw,2.5rem);color:var(--gold2);letter-spacing:3px;text-shadow:0 0 40px rgba(201,168,76,.6)">LABYRINTH CLEARED</div>
+      <span style="font-size:5rem;display:block;margin:.8rem 0;filter:drop-shadow(0 0 15px var(--gold));animation:trophyPulse 1s infinite alternate">🏆</span>
+      <div id="w3d-rank" style="font-family:'Cinzel Decorative',serif;font-size:.9rem;color:var(--gold);letter-spacing:2px;margin-bottom:1rem"></div>
+      <div style="background:rgba(8,14,8,.98);border:1px solid rgba(201,168,76,.25);padding:.85rem 1.2rem;margin:.8rem 0" id="w3d-vstats"></div>
+      <button class="btn-enter-temple" style="margin-top:1rem" onclick="showScreen('hub');updateHUD()">◀ RETURN TO MAP</button>
+    </div>
+  </div>
+  <button onclick="showScreen('hub')" style="position:absolute;top:.6rem;right:.8rem;z-index:15;background:rgba(0,0,0,.85);border:1px solid rgba(201,168,76,.28);color:var(--gold);padding:.38rem .85rem;font-family:'Rajdhani',sans-serif;font-size:.78rem;font-weight:700;cursor:pointer;letter-spacing:2px">◀ RETREAT</button>
+</div>
+
+<script>
+/* ════════════════════════════════════
+   GAME STATE
+════════════════════════════════════ */
+const G = {
+  hp:100, maxHp:100, xp:0, maxXp:300,
+  coins:300, labXP:0, labCorrect:0, monstersSlain:0,
+  inventory:[]
+};
+
+/* ════════════════════════════════════
+   NAVIGATION
+════════════════════════════════════ */
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+
+// Simple, smooth intro → hub with quick fade
+function enterTemple() {
+  const ov = document.getElementById('transOverlay');
+  // Force reflow so transition fires
+  ov.style.transition = 'none';
+  ov.style.opacity = '0';
+  ov.style.pointerEvents = 'all';
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      ov.style.transition = 'opacity 0.4s ease';
+      ov.style.opacity = '1';
+    });
+  });
+  setTimeout(() => {
+    showScreen('hub');
+    updateHUD();
+    ov.style.transition = 'opacity 0.4s ease';
+    ov.style.opacity = '0';
+    setTimeout(() => { ov.style.pointerEvents = 'none'; }, 400);
+  }, 420);
+}
+
+function updateHUD() {
+  document.getElementById('hpBar').style.width  = (G.hp/G.maxHp*100)+'%';
+  document.getElementById('hpVal').textContent  = G.hp+'/'+G.maxHp;
+  document.getElementById('xpBar').style.width  = (G.xp/G.maxXp*100)+'%';
+  document.getElementById('xpVal').textContent  = G.xp+'/'+G.maxXp;
+  document.getElementById('coinVal').textContent = G.coins;
+}
+
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast'; t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2500);
+}
+
+/* ════════════════════════════════════
+   MONSTERS
+════════════════════════════════════ */
+const MONSTERS = [
+  {
+    id:'goblin1', name:'Goblin Thief — "Phishfang"',
+    type:'PHISHING ATTACK', badgeClass:'mb-phish', icon:'👺', isBoss:false,
+    hpPct:70, threatClass:'th-hi', threatLabel:'⚠ THREAT: HIGH',
+    desc:'A cunning goblin wearing a stolen bank uniform. It waves an urgent scroll bearing a false seal.',
+    sit:'The goblin materialises from shadows, thrusting a glowing scroll: "URGENT! Account suspended — verify NOW at the rune-link or lose everything!" The sender seal reads: security@b4nk0findia.com',
+    q:'🔱 FORK: How do you handle this phishing scroll?',
+    routes:[
+      {t:'Touch the rune-link — the seal looks real!', c:false},
+      {t:'"b4nk0findia" uses "4" not "a" — typosquatting. Ignore and report.', c:true},
+      {t:'Reply to the scroll asking for confirmation', c:false},
+      {t:'Forward it to companions first, then decide', c:false}
+    ],
+    win:'The goblin dissolves! "b4nk0findia" — numbers replacing letters — is classic typosquatting. Real banks never send countdown urgency links.',
+    lose:'The goblin steals your credentials and vanishes!',
+    learn:'Always inspect sender domains character-by-character. Phishfang uses subtle swaps: 0→o, 4→a. Legitimate services NEVER create countdown urgency via email.',
+    penalty:{hp:-20,coins:-40}, loseEmoji:'👺'
+  },
+  {
+    id:'mimic1', name:'Mirror Mimic — "Deepface"',
+    type:'IMPERSONATION / DEEPFAKE', badgeClass:'mb-mimic', icon:'🎭', isBoss:false,
+    hpPct:60, threatClass:'th-hi', threatLabel:'⚠ THREAT: HIGH',
+    desc:'A shapeshifter wearing the perfect face of someone you trust. Its edges shimmer at the hairline.',
+    sit:'A holographic screen activates — a video call from your uncle\'s number. His face, his voice. "Beta, I\'m stuck at the airport. Wallet stolen. Send ₹15,000 to urgenthelp@okaxis RIGHT NOW. Tell no one." The video flickers slightly at the hairline.',
+    q:'🔱 FORK: The Mimic wears a perfect disguise. How do you unmask it?',
+    routes:[
+      {t:'Send immediately — that is clearly my uncle in an emergency!', c:false},
+      {t:'Hang up. Call uncle back on his SAVED number to verify.', c:true},
+      {t:'Ask the caller to spell your secret family password', c:false},
+      {t:'Ask them to tilt their head to check for glitching', c:false}
+    ],
+    win:'The Mimic shatters! Calling back on a KNOWN number is the only bulletproof defence. Deepfake AI cannot intercept your outgoing call.',
+    lose:'The Mimic drains your coin pouch! That face was synthetically generated.',
+    learn:'Deepfake AI perfectly clones faces AND voices. The only reliable defence: hang up, call back on a number you already saved. Mimics cannot follow you across channels.',
+    penalty:{hp:-25,coins:-60}, loseEmoji:'🎭'
+  },
+  {
+    id:'goblin2', name:'Goblin Authority Gang',
+    type:'SOCIAL ENGINEERING', badgeClass:'mb-phish', icon:'👹', isBoss:false,
+    hpPct:55, threatClass:'th-hi', threatLabel:'⚠ THREAT: HIGH',
+    desc:'Three goblins dressed in official government robes, waving an arrest warrant with your name on it.',
+    sit:'"CITIZEN! Your Aadhaar is flagged for criminal activity. An arrest warrant issues in 2 HOURS unless you call our officer and pay ₹2,500 via gift cards immediately. Tell NO ONE." The seal looks perfectly official.',
+    q:'🔱 FORK: Authority + Urgency + Fear all attack at once. What is your move?',
+    routes:[
+      {t:'Panic-call the number immediately to avoid arrest', c:false},
+      {t:'The 2-hour deadline seems suspicious — call the real police', c:false},
+      {t:'Gift card payment demand = 100% scam, regardless of how official it looks. Ignore.', c:true},
+      {t:'Search online to see if others got the same message', c:false}
+    ],
+    win:'The goblin gang flees! No government agency ANYWHERE demands gift card payments. Gift cards are the scammer\'s currency — untraceable, non-refundable.',
+    lose:'The goblins tricked you with false authority!',
+    learn:'Triple threat: Authority + Urgency + Fear overloads rational thinking. Single biggest indicator: gift card demand = ALWAYS a scam. Real government action arrives via registered post.',
+    penalty:{hp:-20,coins:-50}, loseEmoji:'👹'
+  },
+  {
+    id:'mimic2', name:'Software Phantom',
+    type:'MALWARE DISTRIBUTION', badgeClass:'mb-mal', icon:'👾', isBoss:false,
+    hpPct:45, threatClass:'th-cr', threatLabel:'⚠ THREAT: CRITICAL',
+    desc:'A mimic that has perfectly replicated your antivirus software, pulsing with false urgency and a countdown timer.',
+    sit:'A popup explodes — styled exactly like your antivirus: "CRITICAL: 3 malware processes detected! Click DOWNLOAD NOW to patch. Your device is at risk in 60 SECONDS." A countdown begins.',
+    q:'🔱 FORK: The popup looks exactly like your real security software. What now?',
+    routes:[
+      {t:'Click DOWNLOAD — it looks like my real antivirus!', c:false},
+      {t:'Click "Later" then research online if this threat is real', c:false},
+      {t:'Close the popup entirely. Open your actual antivirus app directly to check.', c:true},
+      {t:'Restart device to stop the countdown timer', c:false}
+    ],
+    win:'The Phantom dissolves! Legitimate software updates come ONLY through the official application — never browser popups. Countdown urgency = manipulation.',
+    lose:'The phantom installs malware silently. Your device is compromised.',
+    learn:'Real patches come through the app itself or official OS update channels. Popup download urgency is the primary malware distribution vector. Always navigate directly to the real app.',
+    penalty:{hp:-30,coins:-50}, loseEmoji:'👾'
+  },
+  {
+    id:'mammoth', name:'THE ACCURSED MAMMOTH',
+    type:'BRUTE FORCE ATTACK', badgeClass:'mb-brute', icon:'🐘', isBoss:true,
+    hpPct:100, threatClass:'th-boss', threatLabel:'☠ BOSS ENCOUNTER',
+    desc:'A colossal ancient mammoth, its tusks carved with thousands of failed password attempts. It charges endlessly, testing every combination by brute force. "Try them all... I will find the key..."',
+    sit:'The Mammoth has locked the labyrinth\'s exit gate, trying EVERY possible key combination by sheer force. It has unlimited patience. The gate will fall — unless the lock meets conditions it simply cannot compute.',
+    q:'🔱 BOSS CHALLENGE: Which password completely stops the Mammoth\'s brute force?',
+    bossRule:'⚔ BOSS MECHANIC: The Mammoth cannot crack a password that has <strong>12+ characters</strong> AND <strong>uppercase + lowercase + numbers + symbols</strong> AND is <strong>NOT a dictionary word or personal info</strong>.',
+    routes:[
+      {t:'password123 — easy to remember, I use it everywhere', c:false},
+      {t:'Ramesh1990 — my name and birth year combined', c:false},
+      {t:'Tr0ub4dor&3 — 12 chars, mixed case, number, symbol, no real word', c:true},
+      {t:'ILOVECYBERQUEST — long, but all letters only', c:false}
+    ],
+    win:'🐘 THE ACCURSED MAMMOTH IS DEFEATED! Strong passwords create mathematical impossibility for brute force. The Mammoth collapses — unable to compute what it cannot guess.',
+    lose:'The Mammoth breaks through! Your weak password was cracked in seconds.',
+    learn:'Brute force tries every combination. Defence: 12+ chars + uppercase + lowercase + numbers + symbols + no dictionary words = billions of years to crack. Mathematics defeats the Mammoth.',
+    penalty:{hp:-35,coins:-80}, loseEmoji:'🐘'
+  }
+];
+
+/* ════════════════════════════════════
+   LABYRINTH STATE
+════════════════════════════════════ */
+let labStep = 0;
+let stepsTaken = 0;
+let awaitingMove = false;
+
+function startLabyrinth() {
+  labStep = 0; stepsTaken = 0; awaitingMove = false;
+  G.labXP = 0; G.labCorrect = 0; G.monstersSlain = 0;
+  // Hide overlays
+  document.getElementById('encModal').style.display = 'none';
+  document.getElementById('conOverlay').style.display = 'none';
+  document.getElementById('labVic').style.display = 'none';
+  document.getElementById('movePrompt').style.display = 'none';
+  document.getElementById('labOpening').style.display = 'flex';
+  showScreen('labyrinth');
+  updateLabHUD();
+  buildTrail();
+  updateMM();
+  playOpening();
+}
+
+function updateLabHUD() {
+  document.getElementById('lhp').style.width  = (G.hp/G.maxHp*100)+'%';
+  document.getElementById('lhpv').textContent = G.hp;
+  document.getElementById('lcoins').textContent = G.coins;
+  document.getElementById('lxp').textContent   = G.labXP+' XP';
+  document.getElementById('lkills').textContent = G.monstersSlain+' slain';
+}
+
+function buildTrail() {
+  const bar = document.getElementById('trailBar');
+  bar.innerHTML = '<span style="font-size:.58rem;color:var(--muted);font-family:\'Share Tech Mono\',monospace;letter-spacing:2px;margin-right:.35rem">PATH</span>';
+  MONSTERS.forEach((m,i) => {
+    const d = document.createElement('div');
+    d.id = 'td'+i;
+    d.className = 'tdot'+(m.isBoss?' boss-dot':'')+(i===labStep?' now':'');
+    bar.appendChild(d);
+    if(i < MONSTERS.length-1){
+      const sep = document.createElement('div');
+      sep.style.cssText = 'width:7px;height:1px;background:rgba(255,255,255,.1);margin:0 1px;align-self:center;';
+      bar.appendChild(sep);
+    }
+  });
+  const flag = document.createElement('span');
+  flag.style.cssText = 'font-size:.8rem;margin-left:.3rem;';
+  flag.textContent = '🏆';
+  bar.appendChild(flag);
+}
+
+function updateTrail() {
+  MONSTERS.forEach((_,i) => {
+    const d = document.getElementById('td'+i);
+    if(!d) return;
+    const boss = MONSTERS[i].isBoss ? ' boss-dot' : '';
+    d.className = 'tdot'+boss+(i<labStep?' done':i===labStep?' now':'');
+  });
+}
+
+const MM_POS = [
+  {left:'50%',top:'82%'},{left:'28%',top:'63%'},
+  {left:'66%',top:'46%'},{left:'38%',top:'28%'},{left:'58%',top:'13%'}
+];
+function updateMM() {
+  const pos = MM_POS[Math.min(labStep, MM_POS.length-1)];
+  const d = document.getElementById('mmDot');
+  d.style.left = pos.left; d.style.top = pos.top;
+}
+
+/* ════════════════════════════════════
+   OPENING CINEMATIC
+════════════════════════════════════ */
+let openingTimers = [];
+
+function clearOpeningTimers() {
+  openingTimers.forEach(t => clearTimeout(t));
+  openingTimers = [];
+}
+
+function oSet(id, delay, fn) {
+  const t = setTimeout(() => {
+    const el = document.getElementById(id);
+    if(el) fn(el);
+  }, delay);
+  openingTimers.push(t);
+}
+
+function playOpening() {
+  clearOpeningTimers();
+
+  // Reset all elements
+  const toReset = ['oLoc','oDivTop','oTitle','oN1','oN2','oN3','oDivBot','oSub','oEnter'];
+  toReset.forEach(id => {
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.style.transition = 'none';
+    el.style.opacity = '0';
+    el.style.transform = el.tagName === 'DIV' && el.classList.contains('o-divider') ? '' : 'translateY(10px)';
+  });
+  document.getElementById('oDivTop').style.width = '0';
+  document.getElementById('oDivBot').style.width = '0';
+  document.getElementById('openFog').style.opacity = '0';
+  document.getElementById('openFog').style.transition = 'none';
+  document.getElementById('openVig').style.opacity = '0';
+  document.getElementById('openVig').style.transition = 'none';
+  document.getElementById('openScan').classList.remove('sweep');
+  document.getElementById('gateL').classList.remove('open');
+  document.getElementById('gateR').classList.remove('open');
+  document.getElementById('gateL').style.transition = '';
+  document.getElementById('gateR').style.transition = '';
+
+  const show = (id, delay, dur) => oSet(id, delay, el => {
+    el.style.transition = `opacity ${dur||'2.5s'} ease, transform ${dur||'2.5s'} ease`;
+    el.style.opacity = '1';
+    el.style.transform = 'translateY(0)';
+  });
+  const hide = (id, delay) => oSet(id, delay, el => {
+    el.style.transition = 'opacity 1.8s ease';
+    el.style.opacity = '0';
+  });
+
+  // ── PHASE 1: 0–3s — Darkness. Scan line sweeps down ──
+  oSet('openScan', 500, el => el.classList.add('sweep'));
+
+  // ── PHASE 2: 3–6s — Fog & vignette breathe in ──
+  oSet('openFog', 2800, el => { el.style.transition='opacity 3s ease'; el.style.opacity='1'; });
+  oSet('openVig',  3000, el => { el.style.transition='opacity 2.5s ease'; el.style.opacity='1'; });
+
+  // ── PHASE 3: 6–9s — Location tag & top divider ──
+  show('oLoc', 5500, '2.5s');
+  oSet('oDivTop', 7200, el => {
+    el.style.transition = 'width 2.2s ease';
+    el.style.width = 'min(380px,68vw)';
+  });
+
+  // ── PHASE 4: 9–13s — Title drifts up ──
+  oSet('oTitle', 8800, el => { el.textContent = 'You stand before the\nLabyrinth of the Lost'; el.style.whiteSpace='pre-line'; });
+  show('oTitle', 9200, '2.8s');
+
+  // ── PHASE 5: 13–22s — Three narrative lines, deliberate pace ──
+  oSet('oN1', 12800, el => el.textContent = 'The air carries the scent of ancient stone and burning circuits.');
+  show('oN1', 13200, '2.2s');
+
+  oSet('oN2', 16500, el => el.textContent = 'Shapes shift within the darkness ahead — watching, waiting.');
+  show('oN2', 16900, '2.2s');
+
+  oSet('oN3', 20200, el => el.textContent = 'Your gauntlets pulse once. They sense what lies beyond this gate.');
+  show('oN3', 20600, '2.2s');
+
+  // ── PHASE 6: 23–26s — Sub-line & bottom divider ──
+  oSet('oSub', 23500, el => el.textContent = '— only the wise shall pass —');
+  show('oSub', 23800, '2s');
+  oSet('oDivBot', 24800, el => { el.style.transition='width 2s ease'; el.style.width='min(380px,68vw)'; });
+
+  // ── PHASE 7: 26–28s — All text fades out ──
+  ['oLoc','oDivTop','oTitle','oN1','oN2','oN3','oDivBot','oSub'].forEach((id,i) => hide(id, 26500+i*60));
+
+  // ── PHASE 8: 28s — Gates GROAN open, ENTER blazes in ──
+  oSet('gateL', 28200, el => el.classList.add('open'));
+  oSet('gateR', 28200, el => el.classList.add('open'));
+  show('oEnter', 29000, '2s');
+
+  // ── PHASE 9: 31s — World revealed ──
+  const fadeOutTimer = setTimeout(() => {
+    const opening = document.getElementById('labOpening');
+    opening.style.transition = 'opacity 2.8s ease';
+    opening.style.opacity = '0';
+  }, 31000);
+  openingTimers.push(fadeOutTimer);
+
+  const doneTimer = setTimeout(() => {
+    finishOpening();
+  }, 34000);
+  openingTimers.push(doneTimer);
+}
+
+function finishOpening() {
+  // Fade to black, then launch 3D world
+  const ov = document.getElementById('transOverlay');
+  ov.style.transition = 'opacity 0.6s ease';
+  ov.style.opacity = '1';
+  ov.style.pointerEvents = 'all';
+  setTimeout(() => {
+    showScreen('world3d');
+    w3dInit();
+    ov.style.transition = 'opacity 0.8s ease';
+    ov.style.opacity = '0';
+    setTimeout(() => { ov.style.pointerEvents = 'none'; }, 800);
+  }, 700);
+}
+
+function skipOpening() {
+  clearOpeningTimers();
+  // Hide all text instantly
+  ['oLoc','oDivTop','oTitle','oN1','oN2','oN3','oDivBot','oSub'].forEach(id => {
+    const el = document.getElementById(id);
+    if(el){ el.style.transition='none'; el.style.opacity='0'; }
+  });
+  // Fast gate open
+  document.getElementById('gateL').style.transition = 'transform 1.1s ease';
+  document.getElementById('gateR').style.transition = 'transform 1.1s ease';
+  document.getElementById('gateL').classList.add('open');
+  document.getElementById('gateR').classList.add('open');
+  const enter = document.getElementById('oEnter');
+  setTimeout(() => { enter.style.transition='opacity .7s ease'; enter.style.opacity='1'; }, 600);
+  setTimeout(() => {
+    const opening = document.getElementById('labOpening');
+    opening.style.transition = 'opacity 1.2s ease';
+    opening.style.opacity = '0';
+  }, 1400);
+  setTimeout(() => finishOpening(), 2700);
+}
+
+/* ════════════════════════════════════
+   MOVEMENT
+════════════════════════════════════ */
+function registerMoveControls() {
+  document.addEventListener('keydown', onKey);
+  const sc = document.getElementById('fpScene');
+  if(sc){ sc.addEventListener('click', onSceneClick); sc.addEventListener('touchend', onSceneTouch, {passive:true}); }
+}
+function unregisterMoveControls() {
+  document.removeEventListener('keydown', onKey);
+  const sc = document.getElementById('fpScene');
+  if(sc){ sc.removeEventListener('click', onSceneClick); sc.removeEventListener('touchend', onSceneTouch); }
+}
+function onKey(e){ if(['w','W','ArrowUp'].includes(e.key)){ e.preventDefault(); doStep(); } }
+function onSceneClick(e){
+  if(e.target.closest('#encModal,#conOverlay,#labVic,#labHud,#trailBar,#labBack,#movePrompt,button')) return;
+  doStep();
+}
+function onSceneTouch(e){
+  if(e.target.closest('#encModal,#conOverlay,#labVic,#labHud,#trailBar,#labBack,#movePrompt,button')) return;
+  doStep();
+}
+
+function doStep() {
+  if(!awaitingMove) return;
+  // Body bob
+  const body = document.getElementById('fpBody');
+  body.classList.remove('bob'); void body.offsetWidth; body.classList.add('bob');
+  setTimeout(() => body.classList.remove('bob'), 240);
+  // Depth flash
+  const dp = document.getElementById('depthPulse');
+  dp.classList.add('flash'); setTimeout(() => dp.classList.remove('flash'), 120);
+
+  stepsTaken++;
+  const need = (labStep === MONSTERS.length-1) ? 2 : 3;
+  if(stepsTaken >= need) {
+    stepsTaken = 0; awaitingMove = false;
+    document.getElementById('movePrompt').style.display = 'none';
+    unregisterMoveControls();
+    setTimeout(() => showEncounter(labStep), 250);
+  }
+}
+
+/* ════════════════════════════════════
+   MONSTER SPRITES
+════════════════════════════════════ */
+function monsterSVG(m) {
+  if(m.id==='goblin1') return `<svg viewBox="0 0 80 80" width="80" height="80"><ellipse cx="40" cy="30" rx="18" ry="20" fill="#2d5a1a"/><ellipse cx="40" cy="30" rx="14" ry="16" fill="#3a7a22"/><circle cx="33" cy="27" r="4" fill="#ffcc00"/><circle cx="47" cy="27" r="4" fill="#ffcc00"/><circle cx="33" cy="27" r="2" fill="#1a1a00"/><circle cx="47" cy="27" r="2" fill="#1a1a00"/><path d="M34 37 Q40 42 46 37" fill="none" stroke="#1a0a00" stroke-width="2"/><polygon points="25,14 28,4 31,14" fill="#2d5a1a"/><polygon points="49,14 52,4 55,14" fill="#2d5a1a"/><rect x="28" y="45" width="24" height="30" fill="#4a3a1a" rx="3"/><rect x="22" y="48" width="10" height="4" fill="#5a4a2a" rx="2"/><rect x="48" y="48" width="10" height="4" fill="#5a4a2a" rx="2"/><rect x="29" y="49" width="22" height="5" fill="rgba(255,140,0,.3)" rx="1"/><text x="30" y="56" fill="rgba(255,140,0,.8)" font-size="7">BANK</text></svg>`;
+  if(m.id==='mimic1') return `<svg viewBox="0 0 80 80" width="80" height="80"><ellipse cx="40" cy="32" rx="20" ry="22" fill="#1a2a3a"/><ellipse cx="40" cy="32" rx="16" ry="18" fill="#243040"/><circle cx="33" cy="29" r="4" fill="#00ffff" opacity=".8"/><circle cx="47" cy="29" r="4" fill="#00ffff" opacity=".8"/><circle cx="33" cy="29" r="2" fill="#001a1a"/><circle cx="47" cy="29" r="2" fill="#001a1a"/><path d="M33 40 Q40 45 47 40" fill="none" stroke="rgba(0,255,255,.5)" stroke-width="1.5"/><rect x="26" y="52" width="28" height="24" fill="#1a2a3a" rx="3"/><rect x="22" y="55" width="10" height="4" fill="#1a2030" rx="2"/><rect x="48" y="55" width="10" height="4" fill="#1a2030" rx="2"/><text x="28" y="67" fill="rgba(0,255,255,.6)" font-size="7">DEEPFACE</text></svg>`;
+  if(m.id==='goblin2') return `<svg viewBox="0 0 80 80" width="80" height="80"><ellipse cx="40" cy="30" rx="18" ry="20" fill="#2d5a1a"/><ellipse cx="40" cy="30" rx="14" ry="16" fill="#3a7a22"/><circle cx="33" cy="27" r="4" fill="#ffcc00"/><circle cx="47" cy="27" r="4" fill="#ffcc00"/><circle cx="33" cy="27" r="2" fill="#1a1a00"/><circle cx="47" cy="27" r="2" fill="#1a1a00"/><polygon points="25,14 28,4 31,14" fill="#2d5a1a"/><polygon points="49,14 52,4 55,14" fill="#2d5a1a"/><rect x="28" y="45" width="24" height="30" fill="#2a1a4a" rx="3"/><rect x="29" y="49" width="22" height="5" fill="rgba(255,140,0,.3)" rx="1"/><text x="28" y="57" fill="rgba(255,200,0,.8)" font-size="6">GOV.IN</text></svg>`;
+  if(m.id==='mimic2') return `<svg viewBox="0 0 80 80" width="80" height="80"><rect x="10" y="8" width="60" height="50" rx="4" fill="#1a1a2a" stroke="rgba(0,255,255,.3)" stroke-width="1.5"/><rect x="14" y="12" width="52" height="38" rx="2" fill="#0a1520"/><rect x="16" y="14" width="48" height="6" rx="1" fill="#cc0000" opacity=".8"/><text x="18" y="20" fill="white" font-size="5" font-weight="bold">⚠ CRITICAL ALERT</text><text x="16" y="29" fill="#ff6666" font-size="4">Malware detected!</text><rect x="22" y="33" width="36" height="10" rx="2" fill="#cc0000"/><text x="26" y="40" fill="white" font-size="6" font-weight="bold">DOWNLOAD</text><rect x="10" y="56" width="60" height="20" rx="3" fill="#2a2a3a"/><circle cx="40" cy="66" r="6" fill="#ff0000" opacity=".6"/><text x="37" y="69" fill="white" font-size="6">!</text></svg>`;
+  if(m.id==='mammoth') return `<svg viewBox="0 0 80 80" width="80" height="80"><ellipse cx="40" cy="50" rx="28" ry="20" fill="#3a2a18"/><ellipse cx="40" cy="50" rx="24" ry="17" fill="#4a3520"/><ellipse cx="40" cy="30" rx="18" ry="17" fill="#3a2a18"/><ellipse cx="40" cy="30" rx="14" ry="13" fill="#4a3520"/><path d="M22 38 Q14 42 10 60 Q14 62 18 58 Q20 46 24 42Z" fill="#3a2a18"/><path d="M58 38 Q66 42 70 60 Q66 62 62 58 Q60 46 56 42Z" fill="#3a2a18"/><path d="M26 40 Q20 48 18 70" fill="none" stroke="#8a7840" stroke-width="3.5" stroke-linecap="round"/><path d="M54 40 Q60 48 62 70" fill="none" stroke="#8a7840" stroke-width="3.5" stroke-linecap="round"/><path d="M18 70 Q22 75 26 68" fill="none" stroke="#9a8850" stroke-width="2"/><path d="M62 70 Q58 75 54 68" fill="none" stroke="#9a8850" stroke-width="2"/><circle cx="32" cy="27" r="5" fill="#8a7040"/><circle cx="48" cy="27" r="5" fill="#8a7040"/><circle cx="32" cy="27" r="2.5" fill="#9B30FF"/><circle cx="48" cy="27" r="2.5" fill="#9B30FF"/><path d="M20 30 Q14 24 12 18 Q18 16 22 22Z" fill="#7a6830"/><path d="M60 30 Q66 24 68 18 Q62 16 58 22Z" fill="#7a6830"/></svg>`;
+  return `<div style="font-size:3rem">${m.icon}</div>`;
+}
+
+/* ════════════════════════════════════
+   ENCOUNTER
+════════════════════════════════════ */
+function showEncounter(idx) {
+  labStep = idx;
+  updateTrail(); updateMM();
+  const m = MONSTERS[idx];
+  const modal = document.getElementById('encModal');
+
+  const bossRuleHTML = m.isBoss ? `<div class="boss-rule">⚔ <strong>BOSS RULE:</strong> ${m.bossRule}</div>` : '';
+  const routesHTML = m.routes.map((r,i) => `
+    <button class="rbtn" onclick="pickRoute(this,${r.c},${idx})">
+      <span class="rlbl">${['I','II','III','IV'][i]}</span>${r.t}
+    </button>`).join('');
+
+  modal.innerHTML = `
+    <div class="enc-box">
+      <div class="enc-hd">
+        <div class="enc-icon">${m.icon}</div>
+        <div>
+          <div class="enc-type">⚔ ${m.type}</div>
+          <div class="enc-name">${m.name}</div>
+        </div>
+        <div class="enc-threat ${m.threatClass}">${m.threatLabel}</div>
+      </div>
+      <div class="monster-arena">
+        <div>
+          <div class="m-sprite">${monsterSVG(m)}</div>
+          <div class="m-hpbar" style="width:96px">
+            <div class="m-hpbar-lbl">THREAT HP</div>
+            <div class="m-hpbar-track"><div class="m-hpbar-fill" id="mhp${idx}" style="width:${m.hpPct}%"></div></div>
+          </div>
+        </div>
+        <div class="m-info">
+          <div class="m-name">${m.name}</div>
+          <span class="m-badge ${m.badgeClass}">${m.type}</span>
+          <div class="m-desc">${m.desc}</div>
+        </div>
+      </div>
+      <div class="enc-sit">${m.sit}</div>
+      ${bossRuleHTML}
+      <div class="enc-q">${m.q}</div>
+      <div class="routes">${routesHTML}</div>
+    </div>`;
+
+  modal.style.display = 'flex';
+}
+
+function pickRoute(btn, correct, encIdx) {
+  document.querySelectorAll('.rbtn').forEach(b => b.disabled = true);
+  const m = MONSTERS[encIdx];
+  const mhp = document.getElementById('mhp'+encIdx);
+  if(mhp) mhp.style.width = correct ? '0%' : Math.max(0, parseInt(mhp.style.width)-12)+'%';
+
+  if(correct) {
+    btn.classList.add('correct');
+    G.labXP   += m.isBoss ? 120 : 60;
+    G.coins   += m.isBoss ? 80 : 30;
+    G.labCorrect++; G.monstersSlain++;
+    updateLabHUD();
+    setTimeout(() => {
+      document.getElementById('encModal').style.display = 'none';
+      labStep = encIdx+1;
+      updateMM();
+      if(labStep >= MONSTERS.length) showVictory();
+      else resumeWalking();
+    }, 1100);
+  } else {
+    btn.classList.add('wrong');
+    document.querySelectorAll('.rbtn').forEach((b,i) => { if(m.routes[i].c) b.classList.add('correct'); });
+    const sc = document.getElementById('fpScene');
+    sc.classList.add('shake'); setTimeout(() => sc.classList.remove('shake'), 380);
+    setTimeout(() => {
+      document.getElementById('encModal').style.display = 'none';
+      showConsequence(m, encIdx);
+    }, 900);
+  }
+}
+
+function resumeWalking() {
+  stepsTaken = 0; awaitingMove = true;
+  document.getElementById('movePrompt').style.display = 'block';
+  registerMoveControls();
+}
+
+function showConsequence(m, encIdx) {
+  G.hp    = Math.max(0, G.hp + m.penalty.hp);
+  G.coins = Math.max(0, G.coins + m.penalty.coins);
+  updateLabHUD(); updateHUD();
+  const ov = document.getElementById('conOverlay');
+  ov.innerHTML = `
+    <div class="con-box">
+      <div class="con-title">☠ DEAD END</div>
+      <span class="con-emoji">${m.loseEmoji}</span>
+      <div style="font-size:.65rem;color:var(--muted);letter-spacing:2px;text-transform:uppercase;font-family:'Share Tech Mono',monospace;margin:.3rem 0">CONSEQUENCES APPLIED</div>
+      <div class="pen-row">
+        <span class="pen">❤️ ${m.penalty.hp} HP</span>
+        <span class="pen">🪙 ${m.penalty.coins} COINS</span>
+        <span class="pen">⚠ EXPLOITED</span>
+      </div>
+      <div class="con-learn">💡 <strong>DEFENDER WISDOM:</strong> ${m.learn}</div>
+      <div class="con-btns">
+        <button class="cbtn" onclick="retryEnc(${encIdx})">↺ RETRY</button>
+        <button class="cbtn g" onclick="continueEnc(${encIdx})">→ PRESS ON</button>
+      </div>
+    </div>`;
+  ov.style.display = 'flex';
+}
+
+function retryEnc(idx) {
+  document.getElementById('conOverlay').style.display = 'none';
+  showEncounter(idx);
+}
+function continueEnc(idx) {
+  document.getElementById('conOverlay').style.display = 'none';
+  labStep = idx+1; updateMM();
+  if(labStep >= MONSTERS.length) showVictory();
+  else resumeWalking();
+}
+
+function showVictory() {
+  document.querySelectorAll('.tdot').forEach(d => {
+    d.className = d.className.includes('boss-dot') ? 'tdot boss-dot done' : 'tdot done';
+  });
+  G.xp = Math.min(G.maxXp, G.xp + G.labXP);
+  G.coins += 100; updateHUD();
+  const acc = Math.round((G.labCorrect/MONSTERS.length)*100);
+  // Save to Firebase backend
+  if(window.fbSaveRun) window.fbSaveRun(G.labXP, acc, G.hp, G.coins, 'labyrinth');
+  const rank = acc===100 ? '⚔ CYBER LEGEND — FLAWLESS' :
+               acc>=80  ? '🛡 CYBER GUARDIAN — EXCELLENT' :
+               acc>=60  ? '⚡ CYBER DEFENDER — WELL DONE' : '🌀 INITIATE — KEEP TRAINING';
+  const vic = document.getElementById('labVic');
+  vic.innerHTML = `
+    <div class="vic-box">
+      <div class="vic-title">LABYRINTH CLEARED</div>
+      <span class="vic-trophy">🏆</span>
+      <div style="font-family:'Cinzel Decorative',serif;font-size:.8rem;color:var(--gold);letter-spacing:2px;margin-bottom:.9rem">${rank}</div>
+      <div class="vic-card">
+        <div class="vrow"><span>Encounters</span><span style="color:var(--text)">${MONSTERS.length}</span></div>
+        <div class="vrow"><span>First-try kills</span><span style="color:var(--green)">${G.labCorrect} / ${MONSTERS.length}</span></div>
+        <div class="vrow"><span>Boss defeated</span><span style="color:var(--purple)">${G.labCorrect===MONSTERS.length?'✓ FLAWLESS':'Retried'}</span></div>
+        <div class="vrow"><span>XP earned</span><span style="color:#ffd700">+${G.labXP} XP</span></div>
+        <div class="vrow"><span>Accuracy</span><span style="color:var(--gold2)">${acc}%</span></div>
+      </div>
+      <div style="display:flex;gap:.65rem;justify-content:center;flex-wrap:wrap">
+        <button class="btn-enter-temple" style="font-size:.8rem;padding:.65rem 1.3rem" onclick="showScreen('hub');updateHUD()">◀ RETURN TO MAP</button>
+        <button class="btn-enter-temple" style="font-size:.8rem;padding:.65rem 1.3rem;border-color:var(--cyan);color:var(--cyan)" onclick="startLabyrinth()">↺ REPLAY</button>
+      </div>
+    </div>`;
+  vic.style.display = 'flex';
+}
+
+/* ════════════════════════════════════
+   TAVERN (AI bartender)
+════════════════════════════════════ */
+const PERSONA = `You are Greymantle, ancient mystical bartender of the "Tavern of Unnamed Heroes" in a futuristic cyber-temple RPG. Speak in wise, cryptic medieval-fantasy style mixed with cybersecurity knowledge. The labyrinth contains: Goblin Thieves (phishing), Mirror Mimics (deepfakes/impersonation), Authority Gang goblins (social engineering), Software Phantom (malware), and the Accursed Mammoth boss (brute force attacks). Keep replies under 90 words. Stay in character. Be atmospheric and wise.`;
+let chatH = [];
+
+function initTavern() { document.getElementById('tavCoins').textContent = G.coins; }
+
+async function sendMsg() {
+  const el = document.getElementById('chatIn');
+  const msg = el.value.trim(); if(!msg) return;
+  el.value = '';
+  addMsg('me', msg);
+  chatH.push({role:'user', content:msg});
+  const td = document.createElement('div');
+  td.className = 'ctyping'; td.id = 'typing'; td.textContent = 'Greymantle ponders...';
+  document.getElementById('chatMsgs').appendChild(td); scrollChat();
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({model:'claude-sonnet-4-20250514',max_tokens:1000,system:PERSONA,messages:chatH})
+    });
+    const d = await r.json();
+    const reply = d.content?.[0]?.text || '*polishes mug*';
+    chatH.push({role:'assistant', content:reply});
+    document.getElementById('typing')?.remove();
+    addMsg('bart', reply);
+  } catch(e) {
+    document.getElementById('typing')?.remove();
+    addMsg('bart', '*eyes flicker* The mystical connection wavers... The API spirits require a key to channel my full wisdom, traveler.');
+  }
+}
+function addMsg(who, text) {
+  const d = document.createElement('div');
+  d.className = 'cmsg'+(who==='me'?' me':'');
+  d.innerHTML = `<div class="cav ${who==='me'?'p':'b'}">${who==='me'?'⚔':'🧙'}</div><div class="cbub ${who==='me'?'p':'b'}">${text}</div>`;
+  document.getElementById('chatMsgs').appendChild(d); scrollChat();
+}
+function scrollChat() { const c=document.getElementById('chatMsgs'); c.scrollTop=c.scrollHeight; }
+
+/* ════════════════════════════════════
+   GUILD SHOP
+════════════════════════════════════ */
+function buy(name, cost) {
+  if(G.coins < cost) { toast('⚠ Need 🪙'+cost); return; }
+  if(G.inventory.includes(name)) { toast('✓ Already own: '+name); return; }
+  G.coins -= cost; G.inventory.push(name); updateHUD();
+  toast('✅ Acquired: '+name);
+}
+
+/* ════════════════════════════════════
+   LEADERBOARD UI FUNCTIONS
+════════════════════════════════════ */
+let lbActiveTab = 'lb';
+
+function showLeaderboard() {
+  showScreen('leaderboard');
+  // Update guardian badge
+  const badge = document.getElementById('lb-my-id');
+  if(badge) badge.textContent = window.fbGuardianId || 'Identifying Guardian…';
+  // Load whichever tab is active
+  if(lbActiveTab === 'lb') window.fbLoadLeaderboard && window.fbLoadLeaderboard();
+  else                      window.fbLoadAnalytics  && window.fbLoadAnalytics();
+}
+
+function lbSwitchTab(tab) {
+  lbActiveTab = tab;
+  document.getElementById('tab-lb').classList.toggle('active',    tab === 'lb');
+  document.getElementById('tab-stats').classList.toggle('active', tab === 'stats');
+  document.getElementById('panel-lb').style.display    = tab === 'lb'    ? 'block' : 'none';
+  document.getElementById('panel-stats').style.display = tab === 'stats' ? 'block' : 'none';
+  if(tab === 'lb')    window.fbLoadLeaderboard && window.fbLoadLeaderboard();
+  if(tab === 'stats') window.fbLoadAnalytics   && window.fbLoadAnalytics();
+}
+
+function lbRefresh() {
+  const badge = document.getElementById('lb-my-id');
+  if(badge) badge.textContent = window.fbGuardianId || 'Identifying Guardian…';
+  if(lbActiveTab === 'lb') window.fbLoadLeaderboard && window.fbLoadLeaderboard();
+  else                     window.fbLoadAnalytics   && window.fbLoadAnalytics();
+}
+</script>
+
+<script>
+/* ════════════════════════════════════════════════════════
+   3D WORLD ENGINE — FIRST PERSON · WASD COMBAT · AGGRO TIMER
+════════════════════════════════════════════════════════ */
+
+let w3dRenderer, w3dScene, w3dCamera, w3dAnimId;
+let w3dSwordGroup, w3dSwordLight;
+let w3dAldric;
+let w3dTorches = [];
+let w3dMonsterMesh = null;
+let w3dWalking = false, w3dWalkBack = false;
+let w3dEncIdx = 0;
+let w3dEncTriggered = false;
+let w3dPhase = 'aldric';
+
+// First-person camera position (no avatar body — pure FP)
+let fpYaw = 0;   // left-right head rotation
+const FP_EYE_Y = 1.72; // eye height
+
+// Aldric dialogue
+const ALDRIC_LINES = [
+  "Halt, Guardian. You seek the Labyrinth of the Lost?",
+  "Many have entered. Few return with their wits intact.",
+  "Within those walls lurk Goblin Thieves, Mirror Mimics, and far worse.",
+  "Remember my face. I will be here when you return.",
+  "Trust no one who wears a familiar face in an unfamiliar place.",
+  "Now go. The labyrinth awaits. Good luck — you will need it."
+];
+let dlgIdx = 0, dlgTyping = false, dlgTimer = null, dlgFull = '';
+
+// Encounter data
+const W3D_ENCOUNTERS = [
+  {
+    id:'goblin', name:'PHISHFANG', type:'PHISHING ATTACK',
+    spawnZ:-20, hp:3, maxHp:3, trophy:'👺',
+    title:'PHISHING AMBUSH FOILED!',
+    analogy:'"Phishfang disguised itself as an ordinary rock — just like a phishing email hides behind a familiar logo, a trusted name, a convincing seal."',
+    lesson:'Phishing relies on camouflage. Always inspect sender domains character-by-character. "b4nk0findia" uses numbers to mimic letters. Real banks NEVER send countdown urgency links.',
+    reward:{xp:60,coins:30}
+  },
+  {
+    id:'mimic', name:'DEEPFACE — THE MIMIC', type:'DEEPFAKE / IMPERSONATION',
+    spawnZ:-38, hp:3, maxHp:3, trophy:'🎭',
+    title:'IMPERSONATION UNMASKED!',
+    analogy:'"It wore Aldric\'s face. Deepfakes don\'t create strangers — they steal the people you already believe."',
+    lesson:'When someone familiar appears asking for urgent action — hang up. Call back on a number YOU saved.',
+    reward:{xp:80,coins:40}
+  },
+  {
+    id:'gang', name:'AUTHORITY GANG', type:'SOCIAL ENGINEERING',
+    spawnZ:-56, hp:3, maxHp:3, trophy:'👹',
+    title:'MANIPULATION RESISTED!',
+    analogy:'"Authority + Urgency + Fear — the three weapons of social engineering. Panic was the weapon."',
+    lesson:'No government agency demands gift card payments. The moment you feel rushed and scared — slow down. That feeling IS the attack.',
+    reward:{xp:70,coins:35}
+  },
+  {
+    id:'phantom', name:'SOFTWARE PHANTOM', type:'MALWARE',
+    spawnZ:-74, hp:3, maxHp:3, trophy:'👾',
+    title:'MALWARE PHANTOM DESTROYED!',
+    analogy:'"It glowed like a health orb — something helpful, something safe. That\'s how malware disguises itself."',
+    lesson:'Legitimate software NEVER delivers patches through popups. Always open your actual antivirus directly.',
+    reward:{xp:80,coins:45}
+  },
+  {
+    id:'mammoth', name:'THE ACCURSED MAMMOTH', type:'BRUTE FORCE ATTACK',
+    spawnZ:-92, hp:5, maxHp:5, trophy:'🐘', isBoss:true,
+    title:'MAMMOTH DEFEATED — LABYRINTH CLEARED!',
+    analogy:'"The Mammoth never stops. It charges every combination forever. Your only defence is mathematical impossibility."',
+    lesson:'Brute force tries every combination. Defence: 12+ chars + uppercase + lowercase + numbers + symbols + no dictionary words = billions of years to crack.',
+    reward:{xp:120,coins:80}
+  }
+];
+
+/* ── COMBAT STATE ──
+   aggroTimer   : 3-second countdown before monster starts attacking
+   attackLoop   : interval for repeated monster attacks
+   attackCount  : how many times player has been hit (death at 6-8)
+   playerDodged : true if player pressed D in dodge window
+*/
+let w3dCombat = {
+  active:false, phase:'idle', enc:null, mHp:0,
+  timer:null, strikes:0,
+  aggroTimer:null, attackLoop:null, attackCount:0,
+  inDodgeWindow:false, playerDodged:false
+};
+
+/* ─────────────────────────────────────────────────────
+   INIT
+───────────────────────────────────────────────────── */
+function w3dInit() {
+  w3dPhase = 'aldric';
+  w3dEncIdx = 0;
+  w3dEncTriggered = false;
+  w3dWalking = false;
+  w3dWalkBack = false;
+  dlgIdx = 0;
+  w3dMonsterMesh = null;
+  fpYaw = 0;
+
+  const canvas = document.getElementById('w3dCanvas');
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+
+  if(w3dAnimId) cancelAnimationFrame(w3dAnimId);
+
+  w3dRenderer = new THREE.WebGLRenderer({canvas, antialias:true});
+  w3dRenderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+  w3dRenderer.setSize(window.innerWidth, window.innerHeight);
+  w3dRenderer.shadowMap.enabled = true;
+  w3dRenderer.setClearColor(0x000204);
+
+  w3dScene = new THREE.Scene();
+  w3dScene.fog = new THREE.FogExp2(0x000204, 0.022);
+
+  // First-person camera — eye level
+  w3dCamera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.05, 80);
+  w3dCamera.position.set(0, FP_EYE_Y, 5.5);
+  w3dCamera.lookAt(0, FP_EYE_Y, 0);
+
+  window.addEventListener('resize', w3dResize);
+  document.addEventListener('keydown', w3dOnKey);
+  document.addEventListener('keyup', w3dOnKeyUp);
+  canvas.addEventListener('click', w3dOnClick);
+  canvas.addEventListener('touchstart', w3dOnTouch, {passive:false});
+
+  w3dBuildWorld();
+  w3dBuildAldric();
+  w3dUpdateHUD();
+
+  setTimeout(() => w3dShowDlg('ALDRIC THE GUARD', ALDRIC_LINES[0]), 900);
+
+  w3dLoop();
+}
+
+function w3dResize() {
+  if(!w3dRenderer) return;
+  w3dRenderer.setSize(window.innerWidth, window.innerHeight);
+  w3dCamera.aspect = window.innerWidth / window.innerHeight;
+  w3dCamera.updateProjectionMatrix();
+}
+
+/* ─────────────────────────────────────────────────────
+   WORLD — torch-lit dark corridor
+───────────────────────────────────────────────────── */
+function w3dBuildWorld() {
+  const W=5.5, H=4.5, L=130;
+  const stoneMat  = new THREE.MeshLambertMaterial({color:0x14181f});
+  const floorMat  = new THREE.MeshLambertMaterial({color:0x0c0e12});
+
+  // Floor
+  const fl = new THREE.Mesh(new THREE.PlaneGeometry(W, L), floorMat);
+  fl.rotation.x = -Math.PI/2; fl.position.set(0, 0, -L/2+6);
+  w3dScene.add(fl);
+  // Ceiling
+  const ce = new THREE.Mesh(new THREE.PlaneGeometry(W, L), stoneMat);
+  ce.rotation.x = Math.PI/2; ce.position.set(0, H, -L/2+6);
+  w3dScene.add(ce);
+  // Walls
+  [[- W/2, Math.PI/2], [W/2, -Math.PI/2]].forEach(([x, ry]) => {
+    const wm = new THREE.Mesh(new THREE.PlaneGeometry(L, H), stoneMat);
+    wm.rotation.y = ry; wm.position.set(x, H/2, -L/2+6);
+    w3dScene.add(wm);
+  });
+  // Back wall
+  const wb = new THREE.Mesh(new THREE.PlaneGeometry(W, H), stoneMat);
+  wb.position.set(0, H/2, -L+6);
+  w3dScene.add(wb);
+
+  // Floor stone tiles
+  for(let z = -90; z < 10; z += 2.8) {
+    const tile = new THREE.Mesh(
+      new THREE.PlaneGeometry(5.2, 0.02),
+      new THREE.MeshBasicMaterial({color:0x1a2030, transparent:true, opacity:0.6})
+    );
+    tile.rotation.x = -Math.PI/2; tile.position.set(0, 0.005, z);
+    w3dScene.add(tile);
+  }
+  // Wall cyan rune strips
+  for(let z = -85; z < 10; z += 7) {
+    [['-', -W/2+0.01, Math.PI/2], ['+', W/2-0.01, -Math.PI/2]].forEach(([s, x, ry]) => {
+      const strip = new THREE.Mesh(
+        new THREE.PlaneGeometry(0.02, H),
+        new THREE.MeshBasicMaterial({color:0x003355, transparent:true, opacity:0.35})
+      );
+      strip.rotation.y = ry; strip.position.set(x, H/2, z);
+      w3dScene.add(strip);
+    });
+  }
+
+  // Torches — staggered both sides, every 8 units
+  for(let z = -88; z < 8; z += 8) {
+    w3dAddTorch(-W/2+0.15, 2.6, z);
+    w3dAddTorch( W/2-0.15, 2.6, z + 4);
+  }
+
+  // Very dim ambient only — torches do the work
+  w3dScene.add(new THREE.AmbientLight(0x060810, 0.5));
+  // Faint directional from above
+  const dir = new THREE.DirectionalLight(0x0a1428, 0.2);
+  dir.position.set(0, 10, 5);
+  w3dScene.add(dir);
+
+  // Entrance arch
+  const archMat = new THREE.MeshLambertMaterial({color:0x0c1018});
+  const trimMat = new THREE.MeshBasicMaterial({color:0xC9A84C, transparent:true, opacity:0.5});
+  [[-W/2+0.25, 0], [W/2-0.25, 0]].forEach(([x]) => {
+    const p = new THREE.Mesh(new THREE.BoxGeometry(0.5, H, 0.4), archMat);
+    p.position.set(x, H/2, 0.2); w3dScene.add(p);
+    const t = new THREE.Mesh(new THREE.BoxGeometry(0.06, H, 0.06), trimMat);
+    t.position.set(x, H/2, 0.2); w3dScene.add(t);
+  });
+  const top = new THREE.Mesh(new THREE.BoxGeometry(W, 0.5, 0.4), archMat);
+  top.position.set(0, H-0.25, 0.2); w3dScene.add(top);
+}
+
+function w3dAddTorch(x, y, z) {
+  const g = new THREE.Group();
+  // Wall bracket
+  const bracket = new THREE.Mesh(
+    new THREE.BoxGeometry(0.08, 0.06, 0.22),
+    new THREE.MeshLambertMaterial({color:0x3a2808})
+  );
+  bracket.position.set(0, 0, 0.11); g.add(bracket);
+  // Torch stick
+  const stick = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.025, 0.025, 0.45, 6),
+    new THREE.MeshLambertMaterial({color:0x5a3a10})
+  );
+  stick.position.y = 0.22; g.add(stick);
+  // Fire cone
+  const fire = new THREE.Mesh(
+    new THREE.ConeGeometry(0.1, 0.28, 7),
+    new THREE.MeshBasicMaterial({color:0xff6600})
+  );
+  fire.position.y = 0.58; g.add(fire);
+  // Inner bright flame
+  const flame2 = new THREE.Mesh(
+    new THREE.ConeGeometry(0.055, 0.18, 6),
+    new THREE.MeshBasicMaterial({color:0xffdd44})
+  );
+  flame2.position.y = 0.64; g.add(flame2);
+  // Point light — warm orange, long range to illuminate corridor
+  const light = new THREE.PointLight(0xff7700, 1.8, 18);
+  light.position.y = 0.62; g.add(light);
+
+  g.position.set(x, y, z);
+  w3dScene.add(g);
+  w3dTorches.push({fire, flame2, light, base:1.4});
+}
+
+/* ─────────────────────────────────────────────────────
+   ALDRIC — old gruff guard (NO avatar body — FP view)
+───────────────────────────────────────────────────── */
+function w3dBuildAldric() {
+  w3dAldric = new THREE.Group();
+
+  const skin    = new THREE.MeshLambertMaterial({color:0xb07040}); // weathered tan
+  const skinDark= new THREE.MeshLambertMaterial({color:0x8a5530}); // shadow areas
+  const armor   = new THREE.MeshLambertMaterial({color:0x2c3540}); // dark steel
+  const leather = new THREE.MeshLambertMaterial({color:0x3a2810}); // leather undersuit
+  const goldM   = new THREE.MeshBasicMaterial({color:0xaa8822});   // worn gold
+  const greyHair= new THREE.MeshLambertMaterial({color:0x888880}); // grey/white hair
+  const beard   = new THREE.MeshLambertMaterial({color:0x706858}); // grizzled beard
+
+  // ── BOOTS & LEGS ──
+  [-0.2, 0.2].forEach(x => {
+    const boot = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.22, 0.28),
+      new THREE.MeshLambertMaterial({color:0x1a1008}));
+    boot.position.set(x, 0.11, 0.02); w3dAldric.add(boot);
+    // Boot buckle
+    const bkl = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.04, 0.01), goldM);
+    bkl.position.set(x, 0.18, 0.15); w3dAldric.add(bkl);
+    // Lower leg (leather greave)
+    const lleg = new THREE.Mesh(new THREE.CylinderGeometry(0.115, 0.1, 0.55, 8), leather);
+    lleg.position.set(x, 0.49, 0); w3dAldric.add(lleg);
+    // Upper leg
+    const uleg = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.12, 0.55, 8), leather);
+    uleg.position.set(x, 1.02, 0); w3dAldric.add(uleg);
+  });
+
+  // ── TORSO ──
+  const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.32, 0.36, 0.82, 10), leather);
+  torso.position.y = 1.42; w3dAldric.add(torso);
+  // Chest plate (battered steel)
+  const chest = new THREE.Mesh(new THREE.BoxGeometry(0.62, 0.62, 0.14), armor);
+  chest.position.set(0, 1.5, 0.11); w3dAldric.add(chest);
+  // Horizontal dents on chest
+  [-0.12, 0.0, 0.12].forEach(y => {
+    const dent = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.025, 0.01),
+      new THREE.MeshLambertMaterial({color:0x1a2028}));
+    dent.position.set(0, 1.5+y, 0.185); w3dAldric.add(dent);
+  });
+  // Chest gold trim strip
+  const cTop = new THREE.Mesh(new THREE.BoxGeometry(0.64, 0.045, 0.15), goldM);
+  cTop.position.set(0, 1.8, 0.1); w3dAldric.add(cTop);
+  // Belt
+  const belt = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.1, 0.18),
+    new THREE.MeshLambertMaterial({color:0x2a1a08}));
+  belt.position.set(0, 1.08, 0.06); w3dAldric.add(belt);
+  const bkl2 = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.09, 0.02), goldM);
+  bkl2.position.set(0, 1.08, 0.17); w3dAldric.add(bkl2);
+
+  // ── SHOULDERS (pauldrons) ──
+  [-1, 1].forEach(s => {
+    const sh = new THREE.Mesh(new THREE.SphereGeometry(0.22, 8, 8), armor);
+    sh.position.set(s*0.44, 1.82, 0); sh.scale.set(1.1, 0.85, 1); w3dAldric.add(sh);
+    // Pauldron ridge
+    const ridge = new THREE.Mesh(new THREE.TorusGeometry(0.2, 0.022, 5, 14), goldM);
+    ridge.position.set(s*0.44, 1.82, 0); ridge.rotation.x = Math.PI/2; w3dAldric.add(ridge);
+    // Upper arm
+    const ua = new THREE.Mesh(new THREE.CylinderGeometry(0.115, 0.1, 0.52, 8), armor);
+    ua.position.set(s*0.54, 1.52, 0); ua.rotation.z = s*0.18; w3dAldric.add(ua);
+    // Forearm (leather)
+    const fa = new THREE.Mesh(new THREE.CylinderGeometry(0.095, 0.085, 0.46, 8), leather);
+    fa.position.set(s*0.6, 1.18, 0); fa.rotation.z = s*0.22; w3dAldric.add(fa);
+    // Gauntlet
+    const ga = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.16, 0.18), armor);
+    ga.position.set(s*0.66, 0.9, 0); w3dAldric.add(ga);
+  });
+
+  // ── NECK ──
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.115, 0.13, 0.22, 8), skin);
+  neck.position.y = 1.96; w3dAldric.add(neck);
+  // Neck beard stubble
+  const neckB = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.15, 0.12, 8), beard);
+  neckB.position.y = 1.93; w3dAldric.add(neckB);
+
+  // ── HEAD ──
+  const head = new THREE.Group();
+  head.position.y = 2.22;
+
+  // Skull — broad, weathered
+  const skull = new THREE.Mesh(new THREE.SphereGeometry(0.26, 12, 10), skin);
+  skull.scale.set(1.05, 0.96, 1.08); head.add(skull);
+  // Jaw — heavy square jaw
+  const jawM = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.2, 0.34), skinDark);
+  jawM.position.set(0, -0.18, 0.04); head.add(jawM);
+  // Cheekbones
+  [-1, 1].forEach(s => {
+    const cb = new THREE.Mesh(new THREE.SphereGeometry(0.1, 6, 6), skinDark);
+    cb.position.set(s*0.22, 0.04, 0.18); cb.scale.set(1.2, 0.7, 0.9); head.add(cb);
+  });
+
+  // Heavy brow ridge — the hallmark of a gruff guard
+  const browMat = new THREE.MeshLambertMaterial({color:0x8a5030});
+  const browRidge = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.06, 0.1), browMat);
+  browRidge.position.set(0, 0.12, 0.22); browRidge.rotation.x = -0.2; head.add(browRidge);
+  // Individual brow bumps
+  [-1, 1].forEach(s => {
+    const brow = new THREE.Mesh(new THREE.SphereGeometry(0.07, 6, 5), browMat);
+    brow.position.set(s*0.14, 0.13, 0.23); brow.scale.set(1.4, 0.5, 0.8); head.add(brow);
+  });
+
+  // Deep-set eyes
+  [-1, 1].forEach(s => {
+    // Eye socket shadow
+    const sock = new THREE.Mesh(new THREE.SphereGeometry(0.08, 6, 6),
+      new THREE.MeshLambertMaterial({color:0x5a3018}));
+    sock.position.set(s*0.11, 0.06, 0.21); sock.scale.set(1.1, 0.7, 0.7); head.add(sock);
+    // Whites (yellowed with age)
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.055, 8, 8),
+      new THREE.MeshLambertMaterial({color:0xd8cfa0}));
+    eye.position.set(s*0.11, 0.07, 0.225); eye.scale.set(1, 0.75, 0.85); head.add(eye);
+    // Iris — pale grey-blue
+    const iris = new THREE.Mesh(new THREE.SphereGeometry(0.036, 7, 7),
+      new THREE.MeshLambertMaterial({color:0x5a7080}));
+    iris.position.set(s*0.11, 0.07, 0.252); iris.scale.set(1, 0.75, 0.85); head.add(iris);
+    // Pupil
+    const pupil = new THREE.Mesh(new THREE.SphereGeometry(0.02, 5, 5),
+      new THREE.MeshBasicMaterial({color:0x0a0a0a}));
+    pupil.position.set(s*0.11, 0.07, 0.262); head.add(pupil);
+    // Under-eye bags (old guard fatigue)
+    const bag = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.025, 0.05),
+      new THREE.MeshLambertMaterial({color:0x8a5a38}));
+    bag.position.set(s*0.11, 0.025, 0.235); head.add(bag);
+  });
+
+  // Nose — large, crooked (broken in battle)
+  const nose = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.14, 0.12), skin);
+  nose.position.set(0.015, -0.02, 0.28); nose.rotation.z = 0.08; head.add(nose); // slight crook
+  const noseTip = new THREE.Mesh(new THREE.SphereGeometry(0.065, 7, 6), skinDark);
+  noseTip.position.set(0.01, -0.1, 0.295); noseTip.scale.set(1, 0.7, 1); head.add(noseTip);
+  [-1, 1].forEach(s => {
+    const nostril = new THREE.Mesh(new THREE.SphereGeometry(0.028, 5, 5),
+      new THREE.MeshLambertMaterial({color:0x6a3a20}));
+    nostril.position.set(s*0.048, -0.12, 0.284); head.add(nostril);
+  });
+
+  // Scar across left cheek
+  const scar = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.018, 0.01),
+    new THREE.MeshLambertMaterial({color:0xd08060}));
+  scar.position.set(-0.14, 0.0, 0.245); scar.rotation.z = 0.35; head.add(scar);
+
+  // Thick grey moustache
+  const mustache = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.055, 0.06), greyHair);
+  mustache.position.set(0, -0.13, 0.27); mustache.rotation.x = 0.1; head.add(mustache);
+  // Moustache droops at corners
+  [-1, 1].forEach(s => {
+    const droop = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.08, 0.04), greyHair);
+    droop.position.set(s*0.18, -0.16, 0.265); droop.rotation.z = s*0.5; head.add(droop);
+  });
+
+  // Full bushy beard
+  const beardMain = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.32, 0.1), beard);
+  beardMain.position.set(0, -0.26, 0.22); head.add(beardMain);
+  // Beard lower taper
+  const beardLow = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.22, 0.08), beard);
+  beardLow.position.set(0, -0.44, 0.18); head.add(beardLow);
+  // Beard point
+  const beardTip = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.18, 7), beard);
+  beardTip.position.set(0, -0.6, 0.14); head.add(beardTip);
+  // Sideburns — thick and grey
+  [-1, 1].forEach(s => {
+    const sb = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.28, 0.08), greyHair);
+    sb.position.set(s*0.26, -0.05, 0.12); head.add(sb);
+  });
+
+  // Ears — large and prominent
+  [-1, 1].forEach(s => {
+    const ear = new THREE.Mesh(new THREE.SphereGeometry(0.08, 8, 6), skinDark);
+    ear.position.set(s*0.265, 0.02, 0); ear.scale.set(0.45, 1.1, 0.65); head.add(ear);
+    const earInner = new THREE.Mesh(new THREE.SphereGeometry(0.05, 6, 5),
+      new THREE.MeshLambertMaterial({color:0x9a6040}));
+    earInner.position.set(s*0.27, 0.02, 0.01); earInner.scale.set(0.3, 0.8, 0.5); head.add(earInner);
+  });
+
+  // Short grey hair (close-cropped, thinning)
+  const hair1 = new THREE.Mesh(new THREE.SphereGeometry(0.268, 10, 8, 0, Math.PI*2, 0, Math.PI*0.48), greyHair);
+  hair1.position.y = 0.04; head.add(hair1);
+  // Receding temples
+  [-1, 1].forEach(s => {
+    const temple = new THREE.Mesh(new THREE.SphereGeometry(0.14, 7, 6, 0, Math.PI*0.7, 0, Math.PI*0.5), greyHair);
+    temple.position.set(s*0.18, 0.02, -0.05); temple.rotation.y = s*(-Math.PI*0.25); head.add(temple);
+  });
+
+  // Open-face helmet (battle-worn)
+  const helmBody = new THREE.Mesh(
+    new THREE.SphereGeometry(0.285, 8, 8, 0, Math.PI*2, 0, Math.PI*0.42),
+    new THREE.MeshLambertMaterial({color:0x283038})
+  );
+  helmBody.position.y = 0.1; head.add(helmBody);
+  // Helmet nasal (nose guard)
+  const nasal = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.22, 0.04),
+    new THREE.MeshLambertMaterial({color:0x2c3540}));
+  nasal.position.set(0, -0.02, 0.27); head.add(nasal);
+  // Helmet rim — worn gold
+  const helmRim = new THREE.Mesh(
+    new THREE.TorusGeometry(0.278, 0.022, 6, 22, Math.PI*1.1),
+    goldM
+  );
+  helmRim.rotation.x = Math.PI/2; helmRim.position.set(-0.03, -0.06, 0); head.add(helmRim);
+  // Cheek guards
+  [-1, 1].forEach(s => {
+    const cg = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.22, 0.08),
+      new THREE.MeshLambertMaterial({color:0x283038}));
+    cg.position.set(s*0.27, -0.08, 0.08); head.add(cg);
+  });
+
+  w3dAldric.add(head);
+
+  // ── CAPE ──
+  const cape = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.4, 0.58, 1.8, 10, 1, true, Math.PI*0.18, Math.PI*1.65),
+    new THREE.MeshLambertMaterial({color:0x3a1a08}) // dark brown, weathered
+  );
+  cape.position.set(0, 0.82, -0.06); w3dAldric.add(cape);
+
+  // ── SPEAR ──
+  const shaft = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.028, 0.028, 2.4, 6),
+    new THREE.MeshLambertMaterial({color:0x4a3010})
+  );
+  shaft.position.set(0.52, 1.2, 0); w3dAldric.add(shaft);
+  const tip = new THREE.Mesh(
+    new THREE.ConeGeometry(0.065, 0.38, 6),
+    new THREE.MeshLambertMaterial({color:0x707880})
+  );
+  tip.position.set(0.52, 2.58, 0); w3dAldric.add(tip);
+  // Spear butt spike
+  const butt = new THREE.Mesh(new THREE.ConeGeometry(0.03, 0.14, 5),
+    new THREE.MeshLambertMaterial({color:0x606870}));
+  butt.rotation.z = Math.PI; butt.position.set(0.52, -0.02, 0); w3dAldric.add(butt);
+  // Spear crossguard
+  const xguard = new THREE.Mesh(new THREE.BoxGeometry(0.04, 0.24, 0.04), goldM);
+  xguard.position.set(0.52, 2.25, 0); xguard.rotation.z = Math.PI/2; w3dAldric.add(xguard);
+
+  // Shield on back
+  const shield = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.42, 0.38, 0.06, 8),
+    new THREE.MeshLambertMaterial({color:0x1e2830})
+  );
+  shield.rotation.x = Math.PI/2; shield.position.set(-0.35, 1.4, -0.3); w3dAldric.add(shield);
+  const shieldBoss = new THREE.Mesh(new THREE.SphereGeometry(0.1, 7, 7), goldM);
+  shieldBoss.position.set(-0.35, 1.4, -0.26); w3dAldric.add(shieldBoss);
+  // Shield rim
+  const shieldRim = new THREE.Mesh(
+    new THREE.TorusGeometry(0.4, 0.025, 6, 18), goldM
+  );
+  shieldRim.rotation.x = Math.PI/2; shieldRim.position.set(-0.35, 1.4, -0.32); w3dAldric.add(shieldRim);
+
+  // Warm light from Aldric's position (torch he carries)
+  const al = new THREE.PointLight(0xffa040, 1.0, 6);
+  al.position.y = 2.2; w3dAldric.add(al);
+
+  w3dAldric.position.set(0, 0, -1.0);
+  w3dAldric.rotation.y = Math.PI; // faces player
+  w3dScene.add(w3dAldric);
+}
+
+/* ─────────────────────────────────────────────────────
+   MONSTER BUILDERS
+───────────────────────────────────────────────────── */
+function w3dBuildMonster(enc, z) {
+  const g = new THREE.Group();
+
+  if(enc.id === 'goblin') {
+    const gm = new THREE.MeshBasicMaterial({color:0x2d5a1a});
+    const rock = new THREE.Group(); rock.name = 'rock';
+    const rockM = new THREE.MeshBasicMaterial({color:0x3a3a3a});
+    [
+      [0,0,0,.45,.7,1],[.3,.15,.15,.25,.65,1],[-.25,.1,.1,.2,.6,1]
+    ].forEach(([x,y,z2,r,sy]) => {
+      const m = new THREE.Mesh(new THREE.SphereGeometry(r,7,6),rockM);
+      m.scale.y = sy; m.position.set(x,y,z2); rock.add(m);
+    });
+    rock.position.y = 0.25; g.add(rock);
+    const torso = new THREE.Mesh(new THREE.CylinderGeometry(.22,.28,.6,8),gm);
+    torso.position.y=.6;
+    const head2 = new THREE.Mesh(new THREE.SphereGeometry(.22,8,8),gm);
+    head2.position.y=1.1;
+    const eM = new THREE.MeshBasicMaterial({color:0xffcc00});
+    const eL = new THREE.Mesh(new THREE.SphereGeometry(.05,6,6),eM);eL.position.set(-.08,1.14,.18);
+    const eR = new THREE.Mesh(new THREE.SphereGeometry(.05,6,6),eM);eR.position.set(.08,1.14,.18);
+    const earM2 = new THREE.MeshBasicMaterial({color:0x3a7a22});
+    const earL = new THREE.Mesh(new THREE.ConeGeometry(.06,.18,4),earM2);earL.position.set(-.2,1.26,0);earL.rotation.z=-.4;
+    const earR = new THREE.Mesh(new THREE.ConeGeometry(.06,.18,4),earM2);earR.position.set(.2,1.26,0);earR.rotation.z=.4;
+    const aL = new THREE.Mesh(new THREE.CylinderGeometry(.07,.07,.5,6),gm);aL.position.set(-.35,.7,0);aL.rotation.z=.6;
+    const aR = new THREE.Mesh(new THREE.CylinderGeometry(.07,.07,.5,6),gm);aR.position.set(.35,.7,0);aR.rotation.z=-.6;
+    const lL = new THREE.Mesh(new THREE.CylinderGeometry(.09,.07,.5,6),gm);lL.position.set(-.12,.2,0);
+    const lR = new THREE.Mesh(new THREE.CylinderGeometry(.09,.07,.5,6),gm);lR.position.set(.12,.2,0);
+    const badge = new THREE.Mesh(new THREE.BoxGeometry(.25,.18,.03),new THREE.MeshBasicMaterial({color:0x1a3a6a}));
+    badge.position.set(0,.72,.22);
+    g.add(torso,head2,eL,eR,earL,earR,aL,aR,lL,lR,badge);
+
+  } else if(enc.id === 'mimic') {
+    // Built fresh with MeshBasicMaterial — fully visible regardless of scene lighting
+    // Looks identical to Aldric but always self-lit (the uncanny tell)
+    const skin    = new THREE.MeshBasicMaterial({color:0xb07040});
+    const skinDk  = new THREE.MeshBasicMaterial({color:0x8a5530});
+    const armor   = new THREE.MeshBasicMaterial({color:0x2c3540});
+    const leather = new THREE.MeshBasicMaterial({color:0x3a2810});
+    const goldM   = new THREE.MeshBasicMaterial({color:0xaa8822});
+    const greyH   = new THREE.MeshBasicMaterial({color:0x888880});
+    const beardM  = new THREE.MeshBasicMaterial({color:0x706858});
+    const mc = new THREE.Group();
+
+    // Boots & legs
+    [-0.2, 0.2].forEach(x => {
+      const boot = new THREE.Mesh(new THREE.BoxGeometry(0.22,0.22,0.28), new THREE.MeshBasicMaterial({color:0x1a1008}));
+      boot.position.set(x,0.11,0.02); mc.add(boot);
+      const lleg = new THREE.Mesh(new THREE.CylinderGeometry(0.115,0.1,0.55,8), leather);
+      lleg.position.set(x,0.49,0); mc.add(lleg);
+      const uleg = new THREE.Mesh(new THREE.CylinderGeometry(0.13,0.12,0.55,8), leather);
+      uleg.position.set(x,1.02,0); mc.add(uleg);
+    });
+    // Torso + chest plate
+    const torso = new THREE.Mesh(new THREE.CylinderGeometry(0.32,0.36,0.82,10), leather);
+    torso.position.y = 1.42; mc.add(torso);
+    const chest = new THREE.Mesh(new THREE.BoxGeometry(0.62,0.62,0.14), armor);
+    chest.position.set(0,1.5,0.11); mc.add(chest);
+    const cTop = new THREE.Mesh(new THREE.BoxGeometry(0.64,0.045,0.15), goldM);
+    cTop.position.set(0,1.8,0.1); mc.add(cTop);
+    // Shoulders
+    [-1,1].forEach(s => {
+      const sh = new THREE.Mesh(new THREE.SphereGeometry(0.22,8,8), armor);
+      sh.position.set(s*0.44,1.82,0); sh.scale.set(1.1,0.85,1); mc.add(sh);
+      const ua = new THREE.Mesh(new THREE.CylinderGeometry(0.115,0.1,0.52,8), armor);
+      ua.position.set(s*0.54,1.52,0); ua.rotation.z=s*0.18; mc.add(ua);
+      const fa = new THREE.Mesh(new THREE.CylinderGeometry(0.095,0.085,0.46,8), leather);
+      fa.position.set(s*0.6,1.18,0); fa.rotation.z=s*0.22; mc.add(fa);
+    });
+    // Neck
+    const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.115,0.13,0.22,8), skin);
+    neck.position.y=1.96; mc.add(neck);
+    // Head
+    const head = new THREE.Group(); head.position.y=2.22;
+    const skull = new THREE.Mesh(new THREE.SphereGeometry(0.26,12,10), skin);
+    skull.scale.set(1.05,0.96,1.08); head.add(skull);
+    const jaw = new THREE.Mesh(new THREE.BoxGeometry(0.44,0.2,0.34), skinDk);
+    jaw.position.set(0,-0.18,0.04); head.add(jaw);
+    // Brow
+    const brow = new THREE.Mesh(new THREE.BoxGeometry(0.48,0.06,0.1), skinDk);
+    brow.position.set(0,0.12,0.22); head.add(brow);
+    // Eyes — glowing cyan instead of normal (uncanny tell)
+    [-1,1].forEach(s => {
+      const eye = new THREE.Mesh(new THREE.SphereGeometry(0.055,8,8), new THREE.MeshBasicMaterial({color:0xd8cfa0}));
+      eye.position.set(s*0.11,0.07,0.225); eye.scale.set(1,0.75,0.85); head.add(eye);
+      const iris = new THREE.Mesh(new THREE.SphereGeometry(0.038,8,8), new THREE.MeshBasicMaterial({color:0x00ffff})); // cyan glow
+      iris.position.set(s*0.11,0.07,0.252); iris.scale.set(1,0.75,0.85); head.add(iris);
+    });
+    // Nose
+    const nose = new THREE.Mesh(new THREE.BoxGeometry(0.07,0.14,0.12), skin);
+    nose.position.set(0.015,-0.02,0.28); head.add(nose);
+    const noseTip = new THREE.Mesh(new THREE.SphereGeometry(0.065,7,6), skinDk);
+    noseTip.position.set(0.01,-0.1,0.295); noseTip.scale.set(1,0.7,1); head.add(noseTip);
+    // Moustache & beard
+    const must = new THREE.Mesh(new THREE.BoxGeometry(0.3,0.055,0.06), greyH);
+    must.position.set(0,-0.13,0.27); head.add(must);
+    const beardMain = new THREE.Mesh(new THREE.BoxGeometry(0.42,0.32,0.1), beardM);
+    beardMain.position.set(0,-0.26,0.22); head.add(beardMain);
+    const beardLow = new THREE.Mesh(new THREE.BoxGeometry(0.28,0.22,0.08), beardM);
+    beardLow.position.set(0,-0.44,0.18); head.add(beardLow);
+    // Hair
+    const hair1 = new THREE.Mesh(new THREE.SphereGeometry(0.268,10,8,0,Math.PI*2,0,Math.PI*0.48), greyH);
+    hair1.position.y=0.04; head.add(hair1);
+    // Helmet
+    const helm = new THREE.Mesh(new THREE.SphereGeometry(0.285,8,8,0,Math.PI*2,0,Math.PI*0.42), new THREE.MeshBasicMaterial({color:0x283038}));
+    helm.position.y=0.1; head.add(helm);
+    const helmRim = new THREE.Mesh(new THREE.TorusGeometry(0.278,0.022,6,22,Math.PI*1.1), goldM);
+    helmRim.rotation.x=Math.PI/2; helmRim.position.set(-0.03,-0.06,0); head.add(helmRim);
+    mc.add(head);
+    // Cape
+    const cape = new THREE.Mesh(new THREE.CylinderGeometry(0.4,0.58,1.8,10,1,true,Math.PI*0.18,Math.PI*1.65), new THREE.MeshBasicMaterial({color:0x3a1a08}));
+    cape.position.set(0,0.82,-0.06); mc.add(cape);
+    // Spear
+    const shaft = new THREE.Mesh(new THREE.CylinderGeometry(0.028,0.028,2.4,6), new THREE.MeshBasicMaterial({color:0x4a3010}));
+    shaft.position.set(0.52,1.2,0); mc.add(shaft);
+    const tip = new THREE.Mesh(new THREE.ConeGeometry(0.065,0.38,6), new THREE.MeshBasicMaterial({color:0x707880}));
+    tip.position.set(0.52,2.58,0); mc.add(tip);
+    // Shimmer wireframe — glitches during combat
+    const shim = new THREE.Mesh(new THREE.SphereGeometry(0.55,8,8), new THREE.MeshBasicMaterial({color:0x00ffff,transparent:true,opacity:0,wireframe:true}));
+    shim.position.y=1.2; shim.name='shimmer'; mc.add(shim);
+
+    mc.rotation.y = Math.PI; // face player
+    mc.position.set(0,0,z); mc.name='mimic';
+    w3dScene.add(mc); return mc;
+
+  } else if(enc.id === 'gang') {
+    const rM = new THREE.MeshBasicMaterial({color:0x2a1a4a});
+    [-1,0,1].forEach((o,i) => {
+      const gb = new THREE.Group();
+      const to = new THREE.Mesh(new THREE.CylinderGeometry(.2,.28,.8,8),rM); to.position.y=.4;
+      const he = new THREE.Mesh(new THREE.SphereGeometry(.2,8,8),new THREE.MeshBasicMaterial({color:0x2d5a1a})); he.position.y=1.0;
+      const hat = new THREE.Mesh(new THREE.CylinderGeometry(.05,.22,.35,8),new THREE.MeshBasicMaterial({color:0x1a0a2a})); hat.position.y=1.3;
+      gb.add(to,he,hat); gb.position.set(o*.7,0,i*.3); g.add(gb);
+    });
+    const scroll = new THREE.Mesh(new THREE.CylinderGeometry(.05,.05,.5,8),new THREE.MeshBasicMaterial({color:0xd4b896}));
+    scroll.rotation.z=Math.PI/2; scroll.position.set(.3,.8,-.3); g.add(scroll);
+
+  } else if(enc.id === 'phantom') {
+    const orbM = new THREE.MeshBasicMaterial({color:0x00ff88,transparent:true,opacity:.85});
+    const orb = new THREE.Mesh(new THREE.SphereGeometry(.3,12,12),orbM); orb.position.y=1.4; orb.name='orb';
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(.4,.02,8,32),new THREE.MeshBasicMaterial({color:0x00ff88,transparent:true,opacity:.5}));
+    ring.position.y=1.4; ring.rotation.x=Math.PI/2; ring.name='ring';
+    const tb = new THREE.Mesh(new THREE.OctahedronGeometry(.5),new THREE.MeshBasicMaterial({color:0x880000}));
+    tb.position.y=1; tb.visible=false; tb.name='trueForm';
+    for(let i=0;i<6;i++){
+      const an=(i/6)*Math.PI*2;
+      const tent=new THREE.Mesh(new THREE.CylinderGeometry(.03,.01,.8,4),new THREE.MeshBasicMaterial({color:0x550000}));
+      tent.position.set(Math.sin(an)*.4,1,Math.cos(an)*.4);
+      tent.rotation.z=Math.sin(an)*.5; tent.visible=false; tent.name='tentacle'; g.add(tent);
+    }
+    const pl = new THREE.PointLight(0x00ff88,.8,5); pl.position.y=1.4;
+    g.add(orb,ring,tb,pl);
+
+  } else if(enc.id === 'mammoth') {
+    const bM = new THREE.MeshBasicMaterial({color:0x5a4528});
+    const hM = new THREE.MeshBasicMaterial({color:0x4a3420});
+    const body = new THREE.Mesh(new THREE.SphereGeometry(.8,10,8),bM); body.scale.set(1.2,1,.9); body.position.y=1.2;
+    const head3 = new THREE.Mesh(new THREE.SphereGeometry(.55,10,8),hM); head3.position.set(0,2.1,.6);
+    const trunk = new THREE.Mesh(new THREE.CylinderGeometry(.08,.14,.7,8),hM); trunk.position.set(0,1.7,1.0); trunk.rotation.x=.5;
+    const tskM = new THREE.MeshBasicMaterial({color:0xe8d49a});
+    const tL = new THREE.Mesh(new THREE.ConeGeometry(.07,.7,6),tskM); tL.position.set(-.3,1.85,.9); tL.rotation.set(.3,0,-.3);
+    const tR = new THREE.Mesh(new THREE.ConeGeometry(.07,.7,6),tskM); tR.position.set(.3,1.85,.9); tR.rotation.set(.3,0,.3);
+    [[-0.5,0.3],[0.5,0.3],[-0.5,-0.3],[0.5,-0.3]].forEach(([x,zo])=>{
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(.16,.14,.7,8),hM); leg.position.set(x,.35,zo); g.add(leg);
+    });
+    const eM2 = new THREE.MeshBasicMaterial({color:0x9B30FF});
+    const eL2 = new THREE.Mesh(new THREE.SphereGeometry(.08,6,6),eM2); eL2.position.set(-.2,2.2,.95);
+    const eR2 = new THREE.Mesh(new THREE.SphereGeometry(.08,6,6),eM2); eR2.position.set(.2,2.2,.95);
+    const rl = new THREE.PointLight(0x9B30FF,.6,4); rl.position.set(0,2,.5);
+    g.add(body,head3,trunk,tL,tR,eL2,eR2,rl);
+    g.scale.set(1.6,1.6,1.6);
+  }
+
+  g.position.set(0, 0, z);
+  g.name = enc.id;
+  w3dScene.add(g);
+  return g;
+}
+
+/* ─────────────────────────────────────────────────────
+   DIALOGUE
+───────────────────────────────────────────────────── */
+function w3dShowDlg(speaker, text) {
+  const box = document.getElementById('w3d-dlg');
+  box.style.display = 'block';
+  document.getElementById('w3d-spk').textContent = speaker;
+  const el = document.getElementById('w3d-txt');
+  el.textContent = ''; dlgFull = text; dlgTyping = true;
+  let i = 0; clearInterval(dlgTimer);
+  dlgTimer = setInterval(() => {
+    if(i < text.length) { el.textContent += text[i++]; }
+    else { clearInterval(dlgTimer); dlgTyping = false; }
+  }, 28);
+}
+
+function w3dAdvanceDlg() {
+  if(dlgTyping) {
+    clearInterval(dlgTimer);
+    document.getElementById('w3d-txt').textContent = dlgFull;
+    dlgTyping = false; return;
+  }
+  if(dlgIdx < ALDRIC_LINES.length - 1) {
+    dlgIdx++;
+    w3dShowDlg('ALDRIC THE GUARD', ALDRIC_LINES[dlgIdx]);
+  } else {
+    document.getElementById('w3d-dlg').style.display = 'none';
+    dlgIdx = 0;
+    w3dEnterLabyrinth();
+  }
+}
+
+function w3dEnterLabyrinth() {
+  w3dPhase = 'walking';
+  w3dEncIdx = 0;
+  w3dEncTriggered = false;
+  w3dMonsterMesh = w3dBuildMonster(W3D_ENCOUNTERS[0], W3D_ENCOUNTERS[0].spawnZ);
+  document.getElementById('w3d-ctrl').style.display = 'flex';
+  document.getElementById('w3d-zone').textContent = W3D_ENCOUNTERS[0].type;
+  document.getElementById('w3d-ec').textContent = '1 / 5';
+  w3dUpdateCtrlHint('walking');
+}
+
+/* ─────────────────────────────────────────────────────
+   COMBAT — 3-second aggro, persistent attack loop, WASD
+   W = forward  S = back  A = attack  D = dodge
+───────────────────────────────────────────────────── */
+function w3dStartCombat(enc) {
+  w3dPhase = 'combat';
+  w3dCombat = {
+    active:true, phase:'aggro', enc,
+    mHp:enc.hp, timer:null, strikes:0,
+    aggroTimer:null, attackLoop:null, attackCount:0,
+    inDodgeWindow:false, playerDodged:false
+  };
+  document.getElementById('w3d-combat').style.display = 'block';
+  document.getElementById('w3d-mname').textContent = enc.name;
+  document.getElementById('w3d-mtype').textContent = enc.type;
+  document.getElementById('w3d-mhp-fill').style.width = '100%';
+  w3dUpdateCtrlHint('combat-aggro');
+
+  // Reveal disguise visuals
+  if(enc.id === 'goblin') {
+    const rock = w3dMonsterMesh.getObjectByName('rock');
+    if(rock) {
+      let f = 0;
+      const fi = setInterval(() => {
+        rock.visible = !rock.visible;
+        if(++f > 6) { clearInterval(fi); rock.visible = false; }
+      }, 80);
+    }
+  }
+  if(enc.id === 'phantom') {
+    const orb  = w3dMonsterMesh.getObjectByName('orb');
+    const ring = w3dMonsterMesh.getObjectByName('ring');
+    const tf   = w3dMonsterMesh.getObjectByName('trueForm');
+    setTimeout(() => { if(orb) orb.visible=false; if(ring) ring.visible=false; }, 400);
+    setTimeout(() => {
+      if(tf) tf.visible = true;
+      w3dMonsterMesh.children.forEach(c => { if(c.name==='tentacle') c.visible=true; });
+    }, 550);
+  }
+
+  // 3-second aggro window — player can attack first
+  w3dSetAction(`<div style="color:#ffcc00;font-size:.95rem;letter-spacing:2px;font-family:'Share Tech Mono',monospace">⚠ ${enc.name} APPROACHES</div><div style="color:var(--muted);font-size:.72rem;margin-top:.3rem;font-family:'Share Tech Mono',monospace">PRESS [A] TO ATTACK · [D] TO DODGE</div>`);
+
+  w3dCombat.aggroTimer = setTimeout(() => {
+    if(!w3dCombat.active) return;
+    // Player didn't act — monster starts attacking
+    w3dCombat.phase = 'monster-attacking';
+    w3dMonsterAttackLoop();
+  }, 3000);
+}
+
+/* Monster attacks repeatedly every ~2s — player must dodge with D */
+function w3dMonsterAttackLoop() {
+  if(!w3dCombat.active) return;
+  w3dCombat.phase = 'dodge-window';
+  w3dCombat.inDodgeWindow = true;
+  w3dCombat.playerDodged = false;
+
+  const isBoss = w3dCombat.enc.isBoss;
+  const windowMs = isBoss ? 700 : 900; // time to press D
+
+  // Monster charges forward
+  if(w3dMonsterMesh) {
+    const startZ = w3dMonsterMesh.position.z;
+    const targetZ = w3dCamera.position.z - 1.5;
+    w3dMonsterMesh.position.z = THREE.MathUtils.lerp(startZ, targetZ, 0.6);
+  }
+
+  w3dSetAction(`<div style="color:#ff2222;font-size:1.1rem;letter-spacing:3px;animation:blink .3s infinite">⚡ ATTACK INCOMING</div><div style="color:#ff8800;font-size:.82rem;margin-top:.35rem;font-family:'Share Tech Mono',monospace">PRESS [D] TO DODGE</div>`);
+  w3dFlash('hit-warn');
+
+  // Dodge window
+  w3dCombat.timer = setTimeout(() => {
+    if(!w3dCombat.active) return;
+    if(w3dCombat.playerDodged) {
+      // Player dodged — no damage
+      w3dCombat.inDodgeWindow = false;
+      w3dFlash('dok');
+      w3dSetAction(`<div style="color:var(--green);font-size:.95rem;letter-spacing:2px">✓ DODGED!</div><div style="color:var(--muted);font-size:.72rem;margin-top:.3rem;font-family:'Share Tech Mono',monospace">[A] ATTACK · [D] DODGE NEXT</div>`);
+      // Monster retreats slightly
+      if(w3dMonsterMesh) w3dMonsterMesh.position.z += 1.2;
+      setTimeout(() => {
+        if(!w3dCombat.active) return;
+        w3dCombat.phase = 'monster-attacking';
+        setTimeout(() => w3dMonsterAttackLoop(), isBoss ? 1200 : 1600);
+      }, 500);
+    } else {
+      // Player didn't dodge — take damage
+      w3dCombat.inDodgeWindow = false;
+      w3dCombat.attackCount++;
+      const dmg = isBoss ? 20 : 14;
+      G.hp = Math.max(0, G.hp - dmg);
+      w3dUpdateHUD();
+      w3dFlash('hit');
+      // Camera shake
+      const shakeOff = [0.3, -0.3, 0.2, -0.2, 0];
+      shakeOff.forEach((x, i) => {
+        setTimeout(() => { w3dCamera.position.x = x; }, i * 60);
+      });
+
+      if(G.hp <= 0) {
+        w3dDeath(); return;
+      }
+
+      // After 5-8 hits total the player would be dead (handled by HP)
+      w3dSetAction(`<div style="color:#ff2222;font-size:.9rem">💥 HIT! ${G.hp} HP remaining</div><div style="color:var(--muted);font-size:.72rem;margin-top:.3rem;font-family:'Share Tech Mono',monospace">[A] ATTACK · [D] DODGE</div>`);
+      setTimeout(() => {
+        if(!w3dCombat.active) return;
+        w3dCombat.phase = 'monster-attacking';
+        setTimeout(() => w3dMonsterAttackLoop(), isBoss ? 1000 : 1400);
+      }, 600);
+    }
+  }, windowMs);
+}
+
+/* Player attacks with A key */
+function w3dPlayerAttack() {
+  if(!w3dCombat.active) return;
+  if(!['aggro','monster-attacking','dodge-window'].includes(w3dCombat.phase)) return;
+
+  // Cancel aggro or pending attack if in that window
+  clearTimeout(w3dCombat.aggroTimer);
+  clearTimeout(w3dCombat.timer);
+  w3dCombat.inDodgeWindow = false;
+
+  w3dFlash('sok');
+  // Sword lunge — camera jab forward
+  const origZ = w3dCamera.position.z;
+  w3dCamera.position.z -= 0.35;
+  setTimeout(() => { w3dCamera.position.z = origZ; }, 180);
+
+  w3dCombat.mHp--;
+  w3dCombat.strikes++;
+  const pct = (w3dCombat.mHp / w3dCombat.enc.maxHp) * 100;
+  document.getElementById('w3d-mhp-fill').style.width = pct + '%';
+
+  // Monster recoil
+  if(w3dMonsterMesh) {
+    w3dMonsterMesh.position.z -= 1.0;
+    setTimeout(() => { if(w3dMonsterMesh) w3dMonsterMesh.position.z += 0.4; }, 250);
+  }
+
+  if(w3dCombat.mHp <= 0) {
+    w3dCombat.active = false;
+    clearTimeout(w3dCombat.timer);
+    clearInterval(w3dCombat.attackLoop);
+    w3dSetAction('');
+    w3dUpdateCtrlHint('walking');
+    setTimeout(() => w3dCombatWin(), 350);
+  } else {
+    w3dCombat.phase = 'monster-attacking';
+    const isBoss = w3dCombat.enc.isBoss;
+    w3dSetAction(`<div style="color:var(--cyan);font-size:.9rem">⚔ HIT! Monster HP: ${w3dCombat.mHp}/${w3dCombat.enc.maxHp}</div><div style="color:var(--muted);font-size:.72rem;margin-top:.3rem;font-family:'Share Tech Mono',monospace">[A] ATTACK AGAIN · [D] DODGE</div>`);
+    // Monster comes back with a counter after short delay
+    setTimeout(() => {
+      if(!w3dCombat.active) return;
+      w3dMonsterAttackLoop();
+    }, isBoss ? 900 : 1100);
+  }
+}
+
+/* Player dodges with D key */
+function w3dPlayerDodge() {
+  if(!w3dCombat.active) return;
+  if(w3dCombat.inDodgeWindow) {
+    w3dCombat.playerDodged = true;
+    // Side-step camera
+    const dir = Math.random() > 0.5 ? 1.1 : -1.1;
+    w3dCamera.position.x = dir;
+    setTimeout(() => { w3dCamera.position.x = 0; }, 350);
+    return;
+  }
+  // If aggro window — dodge to reposition
+  if(w3dCombat.phase === 'aggro') {
+    const dir = Math.random() > 0.5 ? 0.9 : -0.9;
+    w3dCamera.position.x = dir;
+    setTimeout(() => { w3dCamera.position.x = 0; }, 300);
+  }
+}
+
+/* Player death */
+function w3dDeath() {
+  w3dCombat.active = false;
+  clearTimeout(w3dCombat.aggroTimer);
+  clearTimeout(w3dCombat.timer);
+  w3dPhase = 'dead';
+  document.getElementById('w3d-combat').style.display = 'none';
+  document.getElementById('w3d-ctrl').style.display = 'none';
+  w3dSetAction('');
+
+  const dead = document.getElementById('w3d-vic');
+  dead.style.display = 'flex';
+  document.getElementById('w3d-rank').textContent = '💀 GUARDIAN FALLEN';
+  document.getElementById('w3d-vstats').innerHTML = `
+    <div style="display:flex;justify-content:space-between;padding:.38rem 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.84rem"><span style="color:var(--muted)">Fallen at</span><span style="color:var(--red)">${W3D_ENCOUNTERS[w3dEncIdx]?.name || 'The Labyrinth'}</span></div>
+    <div style="display:flex;justify-content:space-between;padding:.38rem 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.84rem"><span style="color:var(--muted)">Encounters cleared</span><span style="color:var(--gold2)">${w3dEncIdx} / ${W3D_ENCOUNTERS.length}</span></div>
+    <div style="display:flex;justify-content:space-between;padding:.38rem 0;font-size:.84rem"><span style="color:var(--muted)">XP earned</span><span style="color:#ffd700">+${G.xp}</span></div>
+    <div style="text-align:center;margin-top:.8rem;font-size:.78rem;color:var(--muted);font-style:italic">"The Labyrinth claims another soul. Will you return?"</div>`;
+  // Restart button
+  const btn = document.getElementById('w3d-vic').querySelector('button');
+  if(btn) btn.textContent = '↺ TRY AGAIN';
+}
+
+function w3dCombatWin() {
+  const enc = w3dCombat.enc;
+  G.xp += enc.reward.xp; G.coins += enc.reward.coins; w3dUpdateHUD();
+  document.getElementById('w3d-combat').style.display = 'none';
+  w3dSetAction('');
+  if(w3dMonsterMesh) { w3dScene.remove(w3dMonsterMesh); w3dMonsterMesh = null; }
+  setTimeout(() => w3dShowPopup(enc), 400);
+}
+
+function w3dSetAction(html) {
+  document.getElementById('w3d-action').innerHTML = html;
+}
+
+function w3dUpdateCtrlHint(mode) {
+  const el = document.getElementById('w3d-ctrl');
+  if(mode === 'walking') {
+    el.innerHTML = `
+      <div class="wkey">W</div><div class="wtxt">FORWARD</div>
+      <div class="wdiv"></div>
+      <div class="wkey">S</div><div class="wtxt">BACK</div>`;
+  } else if(mode === 'combat-aggro') {
+    el.innerHTML = `
+      <div class="wkey">A</div><div class="wtxt">ATTACK</div>
+      <div class="wdiv"></div>
+      <div class="wkey">D</div><div class="wtxt">DODGE</div>`;
+  }
+  el.style.display = 'flex';
+}
+
+function w3dFlash(cls) {
+  const el = document.getElementById('w3d-flash');
+  el.className = cls; el.classList.add('show');
+  setTimeout(() => { el.classList.remove('show'); el.className = ''; }, 220);
+}
+
+/* ─────────────────────────────────────────────────────
+   POPUP & VICTORY
+───────────────────────────────────────────────────── */
+function w3dShowPopup(enc) {
+  w3dPhase = 'popup';
+  const pop = document.getElementById('w3d-popup');
+  pop.style.display = 'flex';
+  document.getElementById('w3d-ptrophy').textContent = enc.trophy;
+  document.getElementById('w3d-ptitle').textContent = enc.title;
+  document.getElementById('w3d-panalogy').textContent = enc.analogy;
+  document.getElementById('w3d-plesson').textContent = enc.lesson;
+  const rEl = document.getElementById('w3d-prews');
+  rEl.innerHTML = `
+    <span style="background:rgba(255,215,0,.1);border:1px solid rgba(255,215,0,.25);color:#ffd700;font-size:.7rem;padding:.2rem .5rem;font-family:'Share Tech Mono',monospace;border-radius:2px">+${enc.reward.xp} XP</span>
+    <span style="background:rgba(255,215,0,.1);border:1px solid rgba(255,215,0,.25);color:#ffd700;font-size:.7rem;padding:.2rem .5rem;font-family:'Share Tech Mono',monospace;border-radius:2px">+${enc.reward.coins} 🪙</span>
+    ${enc.isBoss?'<span style="background:rgba(155,48,255,.1);border:1px solid rgba(155,48,255,.3);color:var(--purple);font-size:.7rem;padding:.2rem .5rem;font-family:\'Share Tech Mono\',monospace;border-radius:2px">⚡ BOSS SLAIN</span>':''}`;
+  if(w3dEncIdx >= W3D_ENCOUNTERS.length - 1) {
+    document.getElementById('w3d-pbtn').textContent = '🏆 VIEW RESULTS';
+  }
+}
+
+function w3dClosePopup() {
+  document.getElementById('w3d-popup').style.display = 'none';
+  w3dEncIdx++;
+  if(w3dEncIdx >= W3D_ENCOUNTERS.length) {
+    w3dShowVictory();
+  } else {
+    w3dPhase = 'walking';
+    const enc = W3D_ENCOUNTERS[w3dEncIdx];
+    w3dEncTriggered = false;
+    w3dMonsterMesh = w3dBuildMonster(enc, enc.spawnZ);
+    document.getElementById('w3d-zone').textContent = enc.type;
+    document.getElementById('w3d-ec').textContent = (w3dEncIdx+1) + ' / 5';
+    w3dUpdateCtrlHint('walking');
+  }
+}
+
+/* ─────────────────────────────────────────────────────
+   VICTORY
+───────────────────────────────────────────────────── */
+function w3dShowVictory() {
+  w3dPhase = 'victory';
+  document.getElementById('w3d-ctrl').style.display = 'none';
+  const vic = document.getElementById('w3d-vic');
+  vic.style.display = 'flex';
+  const total = W3D_ENCOUNTERS.length;
+  const acc = Math.round((w3dEncIdx / total) * 100);
+  if(window.fbSaveRun) window.fbSaveRun(G.xp, acc, G.hp, G.coins);
+  const rank = acc===100 ? '⚔ CYBER LEGEND — PERFECT RUN' : acc>=80 ? '🛡 CYBER GUARDIAN — EXCELLENT' : '⚡ CYBER DEFENDER — WELL DONE';
+  document.getElementById('w3d-rank').textContent = rank;
+  document.getElementById('w3d-vstats').innerHTML = `
+    <div style="display:flex;justify-content:space-between;padding:.38rem 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.84rem"><span style="color:var(--muted)">Threats neutralised</span><span style="color:var(--green)">${w3dEncIdx} / ${total}</span></div>
+    <div style="display:flex;justify-content:space-between;padding:.38rem 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.84rem"><span style="color:var(--muted)">XP earned</span><span style="color:#ffd700">+${G.xp}</span></div>
+    <div style="display:flex;justify-content:space-between;padding:.38rem 0;border-bottom:1px solid rgba(255,255,255,.05);font-size:.84rem"><span style="color:var(--muted)">Coins</span><span style="color:var(--gold2)">🪙 ${G.coins}</span></div>
+    <div style="display:flex;justify-content:space-between;padding:.38rem 0;font-size:.84rem"><span style="color:var(--muted)">HP remaining</span><span style="color:var(--red)">${G.hp} / 100</span></div>`;
+}
+
+/* ─────────────────────────────────────────────────────
+   HUD
+───────────────────────────────────────────────────── */
+function w3dUpdateHUD() {
+  document.getElementById('w3d-hp').style.width = (G.hp/G.maxHp*100) + '%';
+  document.getElementById('w3d-hpv').textContent = G.hp;
+  document.getElementById('w3d-xp').style.width = (G.xp/G.maxXp*100) + '%';
+  document.getElementById('w3d-xpv').textContent = G.xp;
+  document.getElementById('w3d-cv').textContent = G.coins;
+}
+
+/* ─────────────────────────────────────────────────────
+   INPUT  —  W forward · S back · A attack · D dodge
+───────────────────────────────────────────────────── */
+function w3dOnKey(e) {
+  const active = document.getElementById('world3d').classList.contains('active');
+  if(!active) return;
+
+  if(w3dPhase === 'aldric') {
+    if(['Enter',' '].includes(e.key) || e.code === 'Space' || e.code === 'Enter') {
+      e.preventDefault(); w3dAdvanceDlg();
+    }
+    return;
+  }
+  if(w3dPhase === 'popup' || w3dPhase === 'victory' || w3dPhase === 'dead') return;
+
+  if(w3dPhase === 'combat') {
+    if(e.key==='a'||e.key==='A'||e.key==='ArrowLeft')  { e.preventDefault(); w3dPlayerAttack(); }
+    if(e.key==='d'||e.key==='D'||e.key==='ArrowRight') { e.preventDefault(); w3dPlayerDodge(); }
+    // W/S still move during combat (back away or press forward)
+    if(e.key==='w'||e.key==='W'||e.key==='ArrowUp')   w3dWalking = true;
+    if(e.key==='s'||e.key==='S'||e.key==='ArrowDown') w3dWalkBack = true;
+    return;
+  }
+
+  if(w3dPhase === 'walking') {
+    if(e.key==='w'||e.key==='W'||e.key==='ArrowUp')   w3dWalking  = true;
+    if(e.key==='s'||e.key==='S'||e.key==='ArrowDown') w3dWalkBack = true;
+  }
+}
+
+function w3dOnKeyUp(e) {
+  if(e.key==='w'||e.key==='W'||e.key==='ArrowUp')   w3dWalking  = false;
+  if(e.key==='s'||e.key==='S'||e.key==='ArrowDown') w3dWalkBack = false;
+}
+
+function w3dOnClick(e) {
+  if(w3dPhase==='aldric') { w3dAdvanceDlg(); return; }
+  if(w3dPhase==='combat') { w3dPlayerAttack(); }
+}
+
+function w3dOnTouch(e) {
+  e.preventDefault();
+  if(w3dPhase==='aldric') { w3dAdvanceDlg(); return; }
+  if(w3dPhase==='combat') { w3dPlayerAttack(); }
+  else if(w3dPhase==='walking') { w3dWalking=true; setTimeout(()=>w3dWalking=false, 400); }
+}
+
+/* ─────────────────────────────────────────────────────
+   ANIMATION LOOP
+───────────────────────────────────────────────────── */
+const w3dClock = new THREE.Clock();
+
+function w3dLoop() {
+  w3dAnimId = requestAnimationFrame(w3dLoop);
+  if(!w3dRenderer) return;
+  const dt = w3dClock.getDelta();
+  const t  = w3dClock.getElapsedTime();
+
+  // Torch flicker
+  w3dTorches.forEach((tc, i) => {
+    tc.light.intensity = tc.base + Math.sin(t*7+i)*0.35 + Math.sin(t*17+i*0.7)*0.15;
+    tc.fire.scale.y  = 1 + Math.sin(t*9+i)*0.18;
+    tc.fire.scale.x  = 1 + Math.sin(t*13+i*0.5)*0.1;
+    tc.flame2.scale.y = 1 + Math.sin(t*11+i)*0.2;
+  });
+
+  // Aldric idle
+  if(w3dAldric) {
+    w3dAldric.visible = (w3dPhase === 'aldric');
+    if(w3dAldric.visible) {
+      w3dAldric.rotation.y = Math.PI + Math.sin(t*0.4)*0.04;
+    }
+  }
+
+  // ── FIRST-PERSON WALK ──
+  if(w3dPhase === 'walking' || w3dPhase === 'combat') {
+    const speed = 4.5;
+    if(w3dWalking && !w3dEncTriggered) {
+      w3dCamera.position.z -= speed * dt;
+      // Head bob
+      w3dCamera.position.y = FP_EYE_Y + Math.sin(t*9)*0.025;
+    }
+    if(w3dWalkBack) {
+      w3dCamera.position.z = Math.min(5.5, w3dCamera.position.z + speed * dt);
+      w3dCamera.position.y = FP_EYE_Y + Math.sin(t*9)*0.018;
+    }
+    if(!w3dWalking && !w3dWalkBack) {
+      w3dCamera.position.y = THREE.MathUtils.lerp(w3dCamera.position.y, FP_EYE_Y, 0.12);
+    }
+    // Camera always looks forward (FP)
+    w3dCamera.lookAt(w3dCamera.position.x, w3dCamera.position.y, w3dCamera.position.z - 10);
+
+    // Encounter trigger
+    if(w3dPhase === 'walking') {
+      const enc = W3D_ENCOUNTERS[w3dEncIdx];
+      if(enc && w3dCamera.position.z < enc.spawnZ + 9 && !w3dEncTriggered) {
+        w3dEncTriggered = true;
+        w3dWalking = false;
+        setTimeout(() => w3dStartCombat(enc), 400);
+      }
+    }
+  }
+
+  // Monster idle float / face player
+  if(w3dMonsterMesh && w3dPhase !== 'combat') {
+    if(w3dMonsterMesh.name === 'phantom') {
+      const orb  = w3dMonsterMesh.getObjectByName('orb');
+      const ring = w3dMonsterMesh.getObjectByName('ring');
+      if(orb)  orb.position.y  = 1.4 + Math.sin(t*1.5)*0.12;
+      if(ring) ring.position.y = 1.4 + Math.sin(t*1.5)*0.12;
+    }
+    // Slow menacing rotation
+    w3dMonsterMesh.rotation.y = Math.PI + Math.sin(t*0.8)*0.15;
+  }
+
+  // Monster mimic shimmer
+  if(w3dMonsterMesh && w3dMonsterMesh.name==='mimic' && w3dCombat.active) {
+    const sh = w3dMonsterMesh.getObjectByName('shimmer');
+    if(sh) sh.material.opacity = Math.abs(Math.sin(t*4))*0.18;
+  }
+
+  // Monster charges during combat
+  if(w3dPhase==='combat' && w3dMonsterMesh && w3dCombat.phase==='dodge-window') {
+    const targetZ = w3dCamera.position.z - 1.2;
+    if(w3dMonsterMesh.position.z < targetZ) {
+      w3dMonsterMesh.position.z += 2.5 * dt;
+    }
+    // Face camera
+    w3dMonsterMesh.lookAt(w3dCamera.position.x, 0, w3dCamera.position.z);
+  }
+
+  w3dRenderer.render(w3dScene, w3dCamera);
+}
+</script>
+</body>
+</html>
