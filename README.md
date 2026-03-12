@@ -3,7 +3,7 @@
 > *A cybersecurity awareness game where you battle cyber threats as a Guardian of the Digital Realm*
 
 [![Live Demo](https://img.shields.io/badge/▶%20PLAY%20LIVE-cyberquest--rpg.web.app-gold?style=for-the-badge)](https://cyberquest-rpg.web.app)
-[![SETS Gameathon 2026](https://img.shields.io/badge/SETS%20Gameathon-2026%20Finalist-purple?style=for-the-badge)](https://www.setsindia.net)
+[![SETS Gameathon 2026](https://img.shields.io/badge/SETS%20Gameathon-2026%20Round%202-purple?style=for-the-badge)](https://www.setsindia.net)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
 
 ---
@@ -160,7 +160,7 @@ npx serve .
 | Yashovardhan Reddy Kandi | Co-developer, Internet Rangers |
 
 **Institution:** C.R. Rao AIMSCS, Hyderabad  
-**Competition:** SETS Gameathon 2026 — Round 2 Finalist
+**Competition:** SETS Gameathon 2026 — Round 2 Selected
 
 ---
 
