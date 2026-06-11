@@ -3467,7 +3467,7 @@ let W3D_OBJECTIVES = [];
 const w3dMaterialCache = {};
 const W3D_CELL = 7;
 const W3D_WALL_THICKNESS = 0.55;
-const W3D_CAMERA_NEAR = 0.01;
+const W3D_CAMERA_NEAR = 0.45;
 const W3D_WALL_MARGIN = 0.28;
 const W3D_CAMPAIGN_TIME_LIMIT_SECONDS = 300;
 let w3dCampaignTimerId = null;
@@ -6486,8 +6486,8 @@ function w3dCanWalkTo(x, z) {
   const map = w3dActiveMap();
   const wallClearance = w3dWallClearance(map);
   const inside = w3dAllAreas(map).some(a =>
-    Math.abs(x - a.x) < a.w/2 &&
-    Math.abs(z - a.z) < a.d/2
+    Math.abs(x - a.x) < a.w/2 - wallClearance &&
+    Math.abs(z - a.z) < a.d/2 - wallClearance
   );
   if(!inside) return false;
   const blockedDoor = w3dDoorBlockers.some(door => {
@@ -6806,8 +6806,8 @@ function initBinaryRainCanvas(canvasId, screenId, particleCount = 75) {
   let animationFrameId;
 
   function resize() {
-    canvas.width = canvas.parentElement.clientWidth || window.innerWidth;
-    canvas.height = canvas.parentElement.clientHeight || window.innerHeight;
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
   }
   resize();
   window.addEventListener('resize', resize);
