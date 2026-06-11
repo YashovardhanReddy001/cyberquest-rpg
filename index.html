@@ -2600,6 +2600,17 @@ function showScreen(id) {
       settingsTrigger.style.top = '0.8rem';
     }
   }
+
+  // Trigger canvas resize for binary rain on hub/intro screens
+  if (id === 'hub' || id === 'intro') {
+    const canvasId = id === 'hub' ? 'hubCanvas' : 'introCanvas';
+    const canvas = document.getElementById(canvasId);
+    if (canvas) {
+      const screenEl = document.getElementById(id);
+      canvas.width = window.innerWidth;
+      canvas.height = screenEl ? Math.max(window.innerHeight, screenEl.scrollHeight) : window.innerHeight;
+    }
+  }
 }
 
 // Simple, smooth intro → hub with quick fade
@@ -6486,8 +6497,8 @@ function w3dCanWalkTo(x, z) {
   const map = w3dActiveMap();
   const wallClearance = w3dWallClearance(map);
   const inside = w3dAllAreas(map).some(a =>
-    Math.abs(x - a.x) < a.w/2 - wallClearance &&
-    Math.abs(z - a.z) < a.d/2 - wallClearance
+    Math.abs(x - a.x) < a.w/2 &&
+    Math.abs(z - a.z) < a.d/2
   );
   if(!inside) return false;
   const blockedDoor = w3dDoorBlockers.some(door => {
