@@ -6806,8 +6806,9 @@ function initBinaryRainCanvas(canvasId, screenId, particleCount = 75) {
   let animationFrameId;
 
   function resize() {
+    const screenEl = document.getElementById(screenId);
     canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    canvas.height = screenEl ? Math.max(window.innerHeight, screenEl.scrollHeight) : window.innerHeight;
   }
   resize();
   window.addEventListener('resize', resize);
@@ -6817,7 +6818,7 @@ function initBinaryRainCanvas(canvasId, screenId, particleCount = 75) {
   for (let i = 0; i < particleCount; i++) {
     particles.push({
       x: Math.random() * canvas.width,
-      y: Math.random() * (canvas.height * 2),
+      y: Math.random() * canvas.height,
       speed: 0.5 + Math.random() * 1.5,
       size: 10 + Math.random() * 14,
       char: Math.random() > 0.5 ? '1' : '0',
