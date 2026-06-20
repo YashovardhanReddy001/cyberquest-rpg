@@ -41,6 +41,8 @@ CyberQuest is designed as a fast playable prototype for awareness training:
 
 ![Arcadia Bank Call (Scam Maze)](docs/scam_call.png)
 
+![Ask the Cyber Guide](docs/cyber_guide.png)
+
 ![Leaderboard](docs/leaderboard.png)
 
 
@@ -84,6 +86,7 @@ cyberquest-rpg/
 |   |-- parchment.png
 |   |-- world3.png
 |   |-- scam_call.png
+|   |-- cyber_guide.png
 |   `-- leaderboard.png
 |-- LICENSE
 `-- README.md
