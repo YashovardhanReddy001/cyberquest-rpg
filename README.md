@@ -33,15 +33,16 @@ CyberQuest is designed as a fast playable prototype for awareness training:
 
 ![Title Screen](docs/title.png)
 
-![Hub](docs/hub.png)
+![Mode Selection Hub](docs/hub.png)
 
-![3D World](docs/world3.png)
+![Story Parchment](docs/parchment.png)
 
-![Tavern / Cyber Guide](docs/Tavern.png)
+![3D Labyrinth](docs/world3.png)
 
-![Guild / Toolkit](docs/guild.png)
+![Arcadia Bank Call (Scam Maze)](docs/scam_call.png)
 
 ![Leaderboard](docs/leaderboard.png)
+
 
 ## Cyber Threat Coverage
 
@@ -80,9 +81,9 @@ cyberquest-rpg/
 |-- docs/                   # Screenshots
 |   |-- title.png
 |   |-- hub.png
+|   |-- parchment.png
 |   |-- world3.png
-|   |-- Tavern.png
-|   |-- guild.png
+|   |-- scam_call.png
 |   `-- leaderboard.png
 |-- LICENSE
 `-- README.md
