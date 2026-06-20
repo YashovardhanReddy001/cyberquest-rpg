@@ -87,6 +87,7 @@ cyberquest-rpg/
 |   |-- world3.png
 |   |-- scam_call.png
 |   |-- cyber_guide.png
+|   |-- cyberquest_presentation.pptx
 |   `-- leaderboard.png
 |-- LICENSE
 `-- README.md
