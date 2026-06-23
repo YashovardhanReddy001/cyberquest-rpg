@@ -2617,7 +2617,9 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:8000;
     </div>
   </div>
   <div id="w3d-popup" style="position:absolute;inset:0;z-index:40;background:rgba(0,0,0,.88);display:none;align-items:center;justify-content:center;padding:1rem">
-    <div style="width:min(520px,92vw);background:linear-gradient(180deg,#080f08,#040c04);border:1px solid rgba(0,255,136,.3);clip-path:polygon(0 0,100% 0,100% calc(100% - 16px),calc(100% - 16px) 100%,0 100%)">
+    <div style="width:min(520px,92vw);background:linear-gradient(180deg,#080f08,#040c04);border:1px solid rgba(0,255,136,.3);
+      max-height:calc(100vh - 2rem);overflow-y:auto;
+      clip-path:polygon(0 0,100% 0,100% calc(100% - 16px),calc(100% - 16px) 100%,0 100%)">
       <div style="padding:.75rem 1rem;background:rgba(0,255,136,.06);border-bottom:1px solid rgba(0,255,136,.12)">
         <span id="w3d-ptrophy" style="font-size:3rem;display:block;text-align:center;margin:.5rem 0;animation:trophyPulse 1s infinite alternate">⚔</span>
         <div id="w3d-ptitle" style="font-family:'Cinzel Decorative',serif;font-size:1.1rem;color:var(--green);text-align:center;letter-spacing:3px">THREAT DEFEATED</div>
