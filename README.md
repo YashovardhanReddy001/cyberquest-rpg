@@ -89,6 +89,7 @@ cyberquest-rpg/
 |   |-- cyber_guide.png
 |   |-- cyberquest_presentation.pptx
 |   |-- CyberQuest_RPG_Summary.pdf
+|   |-- CyberQuest_RPG_Summary.docx
 |   `-- leaderboard.png
 |-- LICENSE
 `-- README.md
