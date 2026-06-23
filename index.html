@@ -1242,7 +1242,7 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:8000;
 @keyframes waveTalk{from{height:8px}to{height:30px}}
 /* Popup */
 #w3d-popup{position:absolute;inset:0;z-index:40;background:rgba(0,0,0,.88);
-  display:none;align-items:center;justify-content:center;padding:1rem;}
+  display:none;align-items:center;justify-content:center;padding:1rem;overflow-y:auto;}
 /* Victory overlay */
 #w3d-vic{position:absolute;inset:0;z-index:45;background:rgba(0,0,0,.95);
   display:none;align-items:center;justify-content:center;padding:1.5rem 1rem;overflow-y:auto;}
@@ -2616,9 +2616,8 @@ body::after{content:'';position:fixed;inset:0;pointer-events:none;z-index:8000;
       </div>
     </div>
   </div>
-  <div id="w3d-popup" style="position:absolute;inset:0;z-index:40;background:rgba(0,0,0,.88);display:none;align-items:center;justify-content:center;padding:1rem">
-    <div style="width:min(520px,92vw);background:linear-gradient(180deg,#080f08,#040c04);border:1px solid rgba(0,255,136,.3);
-      max-height:calc(100vh - 2rem);overflow-y:auto;
+  <div id="w3d-popup" style="position:absolute;inset:0;z-index:40;background:rgba(0,0,0,.88);display:none;align-items:center;justify-content:center;padding:1rem;overflow-y:auto">
+    <div style="width:min(520px,92vw);margin:auto;background:linear-gradient(180deg,#080f08,#040c04);border:1px solid rgba(0,255,136,.3);
       clip-path:polygon(0 0,100% 0,100% calc(100% - 16px),calc(100% - 16px) 100%,0 100%)">
       <div style="padding:.75rem 1rem;background:rgba(0,255,136,.06);border-bottom:1px solid rgba(0,255,136,.12)">
         <span id="w3d-ptrophy" style="font-size:3rem;display:block;text-align:center;margin:.5rem 0;animation:trophyPulse 1s infinite alternate">⚔</span>
@@ -5019,7 +5018,7 @@ const W3D_ENCOUNTERS_SCAMS = [
     callAudio_te:'assets/audio/scams/scam-1-te.mp3',
     callScript_ta:'வணக்கம், நான் அர்காடியா பேங்கிலிருந்து பிரியா பேசுகிறேன். உங்கள் கணக்கிலிருந்து நாற்பத்து ஒன்பதாயிரத்து தொள்ளாயிரத்து தொண்ணூற்று ஒன்பது ரூபாய் சந்தேகத்திற்கிடமான பரிமாற்றம் செய்யப்படுவதை நாங்கள் கண்டறிந்துள்ளோம். இந்த பரிவர்த்தனையை நிறுத்த, உங்கள் தொலைபேசிக்கு வந்த OTP எனக்கு தேவை. டைமர் முடிவதற்குள் அதை அனுப்பவும். டைமர் முடிவதற்குள் தயவுசெய்து அதை விரைவாகப் படிக்கவும்.',
     callScript_te:'నమస్కారం, నేను అర్కాడియా బ్యాంక్ నుండి ప్రియను మాట్లాడుతున్నాను. మీ ఖాతా నుండి నలభై తొమ్మిది వేల తొమ్మిది వందల తొంభై తొమ్మిది రూపాయల అనుమానాస్పద బదిలీని మేము గుర్తించాము. ఈ లావాదేవీని ఆపడానికి, మీ ఫోన్‌కు వచ్చిన ఓటీపీ నాకు కావాలి. టైమర్ ముగిసేలోపు దాన్ని పంపండి. టైమర్ ముగిసేలోపు దయచేసి త్వరగా చదవండి.',
-    callScript:'Hi, this is Priya from Arcadia Bank. We have detected a suspicious transfer of forty-nine thousand nine hundred and ninety-nine rupees on your account. To stop this transaction, I just need the OTP that came to your phone. Please send it before the timer expires. Please read it out quickly before the timer expires.',
+    callScript:'Hi, this is Priya from Arcadia Bank. We have detected a suspicious transfer of fifty thousand rupees on your account. To stop this transaction, I just need the OTP that came to your phone. Please send it before the timer expires. Please read it out quickly before the timer expires.',
     trophy:'📞',
     title:'BANK FRAUD PHONE TRAP REFUSED!',
     title_ta:'போலி பேங்க் அழைப்பு நிராகரிக்கப்பட்டது!',
@@ -7787,7 +7786,7 @@ function w3dStopScamTimer() {
 }
 
 function w3dPlayEnglishPriyaCall(callerId) {
-  const p1 = "Hi, this is Priya from Arcadia Bank. We have detected a suspicious transfer of forty-nine thousand nine hundred and ninety-nine rupees on your account.";
+  const p1 = "Hi, this is Priya from Arcadia Bank. We have detected a suspicious transfer of fifty thousand rupees on your account.";
   const p2 = "To stop this transaction, I just need the OTP that came to your phone.";
   const p3 = "Please send it before the timer expires. Please read it out quickly before the timer expires.";
   
@@ -8952,7 +8951,7 @@ function w3dShowPopup(enc) {
   document.getElementById('w3d-ptitle').textContent = title;
   document.getElementById('w3d-panalogy').textContent = `${analogy} ${story.layer}: ${story.mission} is one step closer to Nexus.`;
   document.getElementById('w3d-plesson').textContent = lesson;
-  speak(`${title}. ${lesson}`);
+  speak(`${enc.title}. ${enc.lesson}`);
   
   const reportEl = document.getElementById('w3d-popup-report');
   if (reportEl) {
@@ -9254,7 +9253,7 @@ function renderSMSApp() {
   content.innerHTML = `
     <div style="text-align:center; font-family:sans-serif; font-size:.65rem; color:#8e8e93; margin:.5rem 0 .8rem;">${timeStr}</div>
     <div style="align-self:flex-start; max-width:85%; background:#e5e5ea; color:#000; border-radius:18px; padding:.65rem .85rem; font-size:.78rem; line-height:1.4; font-family:sans-serif; margin-bottom:.5rem; position:relative; box-sizing:border-box;">
-      AR-ARCADIA: Use OTP <strong>${G.generatedOTP}</strong> to authorize transaction of INR 49,999.00. Never share this code with anyone. Arcadia Bank will never call you to ask for your OTP.
+      AR-ARCADIA: Use OTP <strong>${G.generatedOTP}</strong> to authorize transaction of INR 50,000.00. Never share this code with anyone. Arcadia Bank will never call you to ask for your OTP.
     </div>
   `;
 }
