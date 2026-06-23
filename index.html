@@ -3100,8 +3100,13 @@ function speakWithOptions(text, opts={}) {
       
       const utterance = new SpeechSynthesisUtterance(String(text).replace(/\s+/g,' ').trim());
       utterance.lang = opts.lang || 'en-IN';
+      const languageCode = utterance.lang.split('-')[0].toLowerCase();
       const gender = opts.gender || (opts.female ? 'female' : 'male');
       const voice = pickSpeechVoice({ gender, requestedLang:utterance.lang });
+      if (languageCode !== 'en' && !voice) {
+        console.warn("No native TTS voice found for language:", languageCode);
+        return null;
+      }
       if(voice) utterance.voice = voice;
       utterance.rate = opts.rate || 0.95;
       utterance.pitch = opts.pitch || (gender === 'male' ? 0.82 : 1.08);
@@ -5010,7 +5015,7 @@ const W3D_ENCOUNTERS_SCAMS = [
     senderDetail:'+91 98XX-XXX-012 (unknown)',
     requestLabel:'OTP',
     message:'"We detected a suspicious transfer. Tell me the OTP to cancel it now."',
-    callAudio_ta:null,
+    callAudio_ta:'assets/audio/scams/scam-1-ta.mp3',
     callAudio_te:'assets/audio/scams/scam-1-te.mp3',
     callScript_ta:'வணக்கம், நான் அர்காடியா பேங்கிலிருந்து பிரியா பேசுகிறேன். உங்கள் கணக்கிலிருந்து நாற்பத்து ஒன்பதாயிரத்து தொள்ளாயிரத்து தொண்ணூற்று ஒன்பது ரூபாய் சந்தேகத்திற்கிடமான பரிமாற்றம் செய்யப்படுவதை நாங்கள் கண்டறிந்துள்ளோம். இந்த பரிவர்த்தனையை நிறுத்த, உங்கள் தொலைபேசிக்கு வந்த OTP எனக்கு தேவை. டைமர் முடிவதற்குள் அதை அனுப்பவும். டைமர் முடிவதற்குள் தயவுசெய்து அதை விரைவாகப் படிக்கவும்.',
     callScript_te:'నమస్కారం, నేను అర్కాడియా బ్యాంక్ నుండి ప్రియను మాట్లాడుతున్నాను. మీ ఖాతా నుండి నలభై తొమ్మిది వేల తొమ్మిది వందల తొంభై తొమ్మిది రూపాయల అనుమానాస్పద బదిలీని మేము గుర్తించాము. ఈ లావాదేవీని ఆపడానికి, మీ ఫోన్‌కు వచ్చిన ఓటీపీ నాకు కావాలి. టైమర్ ముగిసేలోపు దాన్ని పంపండి. టైమర్ ముగిసేలోపు దయచేసి త్వరగా చదవండి.',
@@ -7924,9 +7929,19 @@ function w3dRenderScamCall(enc, textEl) {
   
   const scriptKey = lang === 'ta' ? 'callScript_ta' : lang === 'te' ? 'callScript_te' : 'callScript';
   const spoken = (enc[scriptKey] || enc.callScript || enc.message || '').replace(/^["“]|["”]$/g, '');
+  
+  // Check if native voice is available for Tamil or Telugu
+  let nativeVoiceAvailable = false;
+  if (lang !== 'en' && 'speechSynthesis' in window) {
+    const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
+    const languageCode = lang.split('-')[0].toLowerCase();
+    nativeVoiceAvailable = voices.some(v => String(v.lang || '').toLowerCase().split('-')[0] === languageCode);
+  }
+  
   const audioKey = lang === 'ta' ? 'callAudio_ta' : lang === 'te' ? 'callAudio_te' : null;
   
-  if (audioKey && w3dPlayScamCallAudio(enc[audioKey], callerId)) {
+  // Fall back to pre-recorded MP3 if no native TTS voice is available
+  if (audioKey && !nativeVoiceAvailable && w3dPlayScamCallAudio(enc[audioKey], callerId)) {
     if (enc.id === 'scam-req-1') {
       let otpTriggered = false;
       let timerTriggered = false;
